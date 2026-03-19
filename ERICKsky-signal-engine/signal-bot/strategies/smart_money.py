@@ -81,28 +81,48 @@ class SmartMoneyStrategy(BaseStrategy):
 
         df_h4 = self._get_df(data, "H4")
         df_h1 = self._get_df(data, "H1")
+        
+        # DEBUG LOGGING - Check data availability
+        logger.info(f"SMC DEBUG {symbol}: H4={df_h4.shape if df_h4 is not None else None}, H1={df_h1.shape if df_h1 is not None else None}")
 
         if df_h4 is None:
+            logger.warning(f"SMC DEBUG {symbol}: No H4 data available!")
             return self._neutral_result(self.name, "No H4 data for SMC")
 
         price = float(df_h4["close"].iloc[-1])
+        
+        # DEBUG
+        logger.info(f"SMC DEBUG {symbol}: Current price={price}")
 
         # ── 1. Order Block Detection (H4) ─────────────────────────────────────
         obs_bull, obs_bear = self._detect_order_blocks(df_h4, pip_size)
         bull_ob = self._nearest_ob(obs_bull, price, pip_size)
         bear_ob = self._nearest_ob(obs_bear, price, pip_size)
+        
+        # DEBUG
+        logger.info(f"SMC DEBUG {symbol}: Order blocks found - bullish={len(obs_bull)}, bearish={len(obs_bear)}")
+        logger.info(f"SMC DEBUG {symbol}: Nearest OB - bull={bull_ob is not None}, bear={bear_ob is not None}")
 
         # ── 2. Fair Value Gap Detection (H1 preferred, H4 fallback) ──────────
         fvg_df  = df_h1 if df_h1 is not None else df_h4
         all_fvg = self._detect_fvgs(fvg_df, pip_size)
         bull_fvg = next((f for f in all_fvg if f.direction == "BULLISH" and not f.filled), None)
         bear_fvg = next((f for f in all_fvg if f.direction == "BEARISH" and not f.filled), None)
+        
+        # DEBUG
+        logger.info(f"SMC DEBUG {symbol}: FVGs found={len(all_fvg)}, bull_fvg={bull_fvg is not None}, bear_fvg={bear_fvg is not None}")
 
         # ── 3. Liquidity Zone Sweeps (H4) ─────────────────────────────────────
         liq_bull_sweep, liq_bear_sweep = self._detect_liquidity_sweeps(df_h4, pip_size)
+        
+        # DEBUG
+        logger.info(f"SMC DEBUG {symbol}: Liquidity sweeps - bull={liq_bull_sweep}, bear={liq_bear_sweep}")
 
         # ── 4. Market Structure (H4) ──────────────────────────────────────────
         mkt_structure = self._market_structure(df_h4)
+        
+        # DEBUG
+        logger.info(f"SMC DEBUG {symbol}: Market structure={mkt_structure}")
 
         # ── Scoring ───────────────────────────────────────────────────────────
         buy_score  = self._compute_score(
@@ -115,8 +135,12 @@ class SmartMoneyStrategy(BaseStrategy):
             structure=mkt_structure, direction="SELL",
             price=price, pip_size=pip_size,
         )
+        
+        # DEBUG
+        logger.info(f"SMC DEBUG {symbol}: Buy score={buy_score}, Sell score={sell_score}")
 
-        if buy_score > sell_score and buy_score >= 40:
+        # FIX 4: Lower threshold from 40 to 25 for partial SMC signals
+        if buy_score > sell_score and buy_score >= 25:
             direction = "BUY"
             score     = buy_score
             active_ob  = bull_ob
@@ -125,7 +149,7 @@ class SmartMoneyStrategy(BaseStrategy):
                 f"Bullish OB={bull_ob is not None} FVG={bull_fvg is not None} "
                 f"LiqSweep={liq_bull_sweep} Struct={mkt_structure}"
             )
-        elif sell_score > buy_score and sell_score >= 40:
+        elif sell_score > buy_score and sell_score >= 25:
             direction = "SELL"
             score     = sell_score
             active_ob  = bear_ob
@@ -140,6 +164,9 @@ class SmartMoneyStrategy(BaseStrategy):
             active_ob  = None
             active_fvg = None
             reasoning  = "No SMC confluence detected"
+        
+        # DEBUG final result
+        logger.info(f"SMC DEBUG {symbol}: FINAL direction={direction}, score={score}")
 
         ob_meta = (
             {"direction": active_ob.direction, "high": active_ob.high, "low": active_ob.low}
@@ -234,18 +261,21 @@ class SmartMoneyStrategy(BaseStrategy):
         l = df["low"].values
         c = df["close"].values
 
+        # FIX 4: Reduce from 3 candles to 2 for order block detection
+        MIN_IMPULSE_CANDLES = 2  # was 3
+        
         for i in range(n):
             candle_range = h[i] - l[i]
-            if candle_range < pip_size * 3:
+            if candle_range < pip_size * 2:  # FIX 4: reduced from 3 to 2 pips min
                 continue  # too small to be meaningful
 
-            # ── Bullish OB: bearish candle → 3 bullish candles ────────────────
+            # ── Bullish OB: bearish candle → 2 bullish candles (was 3) ─────────────
             if c[i] < o[i]:                                    # bearish
-                if i + 3 < len(c):
-                    next3_bull = all(c[i + j] > o[i + j] for j in range(1, 4))
-                    move       = c[i + 3] - l[i]
-                    if next3_bull and move > candle_range * 0.5:
-                        future_slice = l[i + 4:] if i + 4 < len(l) else []
+                if i + MIN_IMPULSE_CANDLES < len(c):
+                    next_bull = all(c[i + j] > o[i + j] for j in range(1, MIN_IMPULSE_CANDLES + 1))
+                    move       = c[i + MIN_IMPULSE_CANDLES] - l[i]
+                    if next_bull and move > candle_range * 0.5:
+                        future_slice = l[i + MIN_IMPULSE_CANDLES + 1:] if i + MIN_IMPULSE_CANDLES + 1 < len(l) else []
                         valid = len(future_slice) == 0 or float(np.min(future_slice)) > l[i]
                         bulls.append(_OrderBlock(
                             direction="BULLISH",
@@ -255,13 +285,13 @@ class SmartMoneyStrategy(BaseStrategy):
                             valid=valid,
                         ))
 
-            # ── Bearish OB: bullish candle → 3 bearish candles ────────────────
+            # ── Bearish OB: bullish candle → 2 bearish candles (was 3) ─────────────
             elif c[i] > o[i]:                                  # bullish
-                if i + 3 < len(c):
-                    next3_bear = all(c[i + j] < o[i + j] for j in range(1, 4))
-                    move       = h[i] - c[i + 3]
-                    if next3_bear and move > candle_range * 0.5:
-                        future_slice = h[i + 4:] if i + 4 < len(h) else []
+                if i + MIN_IMPULSE_CANDLES < len(c):
+                    next_bear = all(c[i + j] < o[i + j] for j in range(1, MIN_IMPULSE_CANDLES + 1))
+                    move       = h[i] - c[i + MIN_IMPULSE_CANDLES]
+                    if next_bear and move > candle_range * 0.5:
+                        future_slice = h[i + MIN_IMPULSE_CANDLES + 1:] if i + MIN_IMPULSE_CANDLES + 1 < len(h) else []
                         valid = len(future_slice) == 0 or float(np.max(future_slice)) < h[i]
                         bears.append(_OrderBlock(
                             direction="BEARISH",
@@ -295,7 +325,7 @@ class SmartMoneyStrategy(BaseStrategy):
         self,
         df: pd.DataFrame,
         pip_size: float,
-        min_pips: float = 3.0,
+        min_pips: float = 1.0,  # FIX 4: reduced from 3.0 to 1.0 pips
     ) -> List[_FVG]:
         """
         Detect Fair Value Gaps in last _FVG_SCAN_CANDLES candles.

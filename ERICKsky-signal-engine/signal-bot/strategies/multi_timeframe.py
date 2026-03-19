@@ -63,26 +63,39 @@ class MultiTimeframeStrategy(BaseStrategy):
         df_h4 = self._get_df(data, "H4")
         df_h1 = self._get_df(data, "H1")
 
-        # ── STEP 1: D1 Trend Direction ────────────────────────────────────────
-        d1_trend, d1_score = self._d1_trend(df_d1)
+        # DEBUG LOGGING - Check data availability
+        logger.info(f"MTF DEBUG {symbol}: D1={df_d1.shape if df_d1 is not None else None}, H4={df_h4.shape if df_h4 is not None else None}, H1={df_h1.shape if df_h1 is not None else None}")
 
-        # BUG FIX 2: Block counter-trend signals based on D1 trend
-        # If D1 shows STRONG_UP, block ALL SELL signals
-        # If D1 shows STRONG_DOWN, block ALL BUY signals
-        d1_direction = "BUY" if "UP" in d1_trend else "SELL" if "DOWN" in d1_trend else "NEUTRAL"
+        # ── STEP 1: Trend Direction (D1 preferred, H4 fallback) ────────────────
+        d1_trend, d1_score = self._d1_trend(df_d1)
         
-        # Store for later counter-trend check after H1 determines signal
+        # DEBUG: Log D1 trend result
+        logger.info(f"MTF DEBUG {symbol}: D1 trend={d1_trend}, score={d1_score}")
+        
+        # FIX 3: If D1 insufficient, use H4 as trend source
+        if d1_trend == "RANGING" or df_d1 is None or len(df_d1) < 50:
+            if df_h4 is not None and len(df_h4) >= 30:
+                h4_trend, h4_score = self._h4_trend(df_h4)
+                logger.info(f"MTF DEBUG {symbol}: D1 insufficient, using H4 trend={h4_trend}, score={h4_score}")
+                if h4_trend != "RANGING":
+                    d1_trend = h4_trend.replace("H4_", "WEAK_")  # Mark as H4-derived
+                    d1_score = h4_score
+        
+        # Determine direction from trend
+        d1_direction = "BUY" if "UP" in d1_trend else "SELL" if "DOWN" in d1_trend else "NEUTRAL"
         self._d1_direction = d1_direction
         self._d1_trend = d1_trend
 
-        if d1_trend == "RANGING":
+        # If still ranging after H4 fallback, return neutral
+        if d1_trend == "RANGING" or d1_direction == "NEUTRAL":
+            logger.info(f"MTF DEBUG {symbol}: Returning NEUTRAL - no clear trend (D1={d1_trend})")
             return StrategyResult(
                 strategy_name=self.name,
                 score=0,
                 direction="NEUTRAL",
                 confidence=0.0,
-                reasoning="D1 price is ranging between EMA50/200 — no trade",
-                metadata={"d1_trend": "RANGING", "h4_zone": "NONE", "h1_signal": "NONE"},
+                reasoning="No clear trend on D1 or H4 — no trade",
+                metadata={"d1_trend": d1_trend, "h4_zone": "NONE", "h1_signal": "NONE"},
             )
 
         # ── STEP 2: H4 Zone ───────────────────────────────────────────────────
@@ -90,6 +103,9 @@ class MultiTimeframeStrategy(BaseStrategy):
 
         # ── STEP 3: H1 Entry Trigger ──────────────────────────────────────────
         h1_signal, h1_detail = self._h1_entry(df_h1)
+        
+        # DEBUG: Log H4 and H1 results
+        logger.info(f"MTF DEBUG {symbol}: H4 zone={h4_zone}, H1 signal={h1_signal}")
 
         # ── Scoring ───────────────────────────────────────────────────────────
         h4_aligns = (
@@ -172,6 +188,9 @@ class MultiTimeframeStrategy(BaseStrategy):
                 },
             )
 
+        # DEBUG: Log final score before returning
+        logger.info(f"MTF DEBUG {symbol}: Final direction={d1_direction}, score={final_score}, confidence={confidence}")
+
         return StrategyResult(
             strategy_name=self.name,
             score=self._safe_score(final_score),
@@ -222,6 +241,34 @@ class MultiTimeframeStrategy(BaseStrategy):
             return "STRONG_DOWN", 100
         if price < e50 and price > e200:
             return "WEAK_DOWN", 65
+        return "RANGING", 0
+
+    def _h4_trend(
+        self, df: Optional[pd.DataFrame]
+    ) -> Tuple[str, int]:
+        """
+        Classify H4 trend using EMA 20 and EMA 50 (faster timeframes).
+        
+        Returns (trend_label, trend_strength_score).
+          H4_UP       → price above both EMAs       → score 85
+          H4_DOWN     → price below both EMAs       → score 85
+          RANGING     → price between EMAs          → score 0
+        """
+        if df is None or len(df) < 30:
+            return "RANGING", 0
+        
+        close  = df["close"]
+        ema20  = self._ema(close, 20)
+        ema50  = self._ema(close, 50)
+        
+        price = float(close.iloc[-1])
+        e20   = float(ema20.iloc[-1])
+        e50   = float(ema50.iloc[-1])
+        
+        if price > e20 and price > e50:
+            return "H4_UP", 85
+        if price < e20 and price < e50:
+            return "H4_DOWN", 85
         return "RANGING", 0
 
     # ── STEP 2: H4 Zone ──────────────────────────────────────────────────────
