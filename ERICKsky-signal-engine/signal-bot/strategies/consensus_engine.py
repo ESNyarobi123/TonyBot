@@ -168,9 +168,10 @@ class ConsensusEngine:
         # BUG FIX: Never allow 2/4 agreement signals regardless of score!
         if agreement_count < 3:
             logger.warning(
-                "🚫 HARD BLOCK: %s has only %d/%d agreement (need 3/4). "
-                "Signal REJECTED regardless of score!",
-                dominant_dir, agreement_count, len(results)
+                "🚫 HARD BLOCK: %s %s has only %d/%d agreement (need 3/4). "
+                "BUY=%d, SELL=%d. Signal REJECTED!",
+                symbol, dominant_dir, agreement_count, len(results),
+                buy_count, sell_count
             )
             return ConsensusResult(
                 direction="NEUTRAL", consensus_score=0, confidence_label="LOW",
@@ -180,23 +181,29 @@ class ConsensusEngine:
                 is_valid=False,
                 reasoning=(
                     f"🚫 HARD BLOCK: {agreement_count}/4 agreement insufficient "
-                    f"(minimum 3/4 required)"
+                    f"(BUY={buy_count}, SELL={sell_count}, need 3/4)"
                 ),
             )
 
-        # ── STEP 3: Weighted score from agreeing strategies ───────────────────
-        total_weight  = 0.0
+        # ── STEP 3: Weighted score from ALL strategies ─────────────────────────
+        # BUG FIX: Use all 4 strategies, not just agreeing ones
+        # This prevents inflated scores from partial weight division
+        # Example: (70×0.25 + 100×0.20) / 0.45 = 66 (WRONG - inflated!)
+        # Correct:   (0×0.25 + 40×0.30 + 70×0.25 + 100×0.20) / 1.0 = 49.5 (REAL!)
+        total_weight  = sum(self.WEIGHTS.values())  # Always 1.0
         weighted_sum  = 0.0
-        for r in agreeing_results:
+        for r in results:
             w = self.WEIGHTS.get(r.strategy_name, 0.25)
+            # NEUTRAL/0 scores contribute 0 but their weight still counts
             weighted_sum  += r.score * w
-            total_weight  += w
 
-        if total_weight == 0:
-            return _empty
-
-        weighted_score  = weighted_sum / total_weight
+        weighted_score  = weighted_sum / total_weight  # Divide by 1.0
         consensus_score = int(round(min(100.0, max(0.0, weighted_score))))
+        
+        logger.info(
+            "Consensus DEBUG %s: weighted_sum=%.2f / total_weight=%.2f = score=%d",
+            symbol, weighted_sum, total_weight, consensus_score
+        )
 
         # ── STEP 4: Minimum score gate ────────────────────────────────────────
         if consensus_score < MIN_CONSENSUS_SCORE:
