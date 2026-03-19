@@ -164,11 +164,13 @@ class ConsensusEngine:
                 reasoning=f"Tied: BUY={buy_count} SELL={sell_count}",
             )
 
-        # ── STEP 2: Minimum agreement gate ───────────────────────────────────
-        if agreement_count < MIN_AGREEMENT:
-            logger.info(
-                "Consensus: only %d/%d agree on %s (need %d) → rejected",
-                agreement_count, len(results), dominant_dir, MIN_AGREEMENT,
+        # ── STEP 2: HARD CHECK - Minimum agreement MUST be 3/4 ───────────────
+        # BUG FIX: Never allow 2/4 agreement signals regardless of score!
+        if agreement_count < 3:
+            logger.warning(
+                "🚫 HARD BLOCK: %s has only %d/%d agreement (need 3/4). "
+                "Signal REJECTED regardless of score!",
+                dominant_dir, agreement_count, len(results)
             )
             return ConsensusResult(
                 direction="NEUTRAL", consensus_score=0, confidence_label="LOW",
@@ -177,8 +179,8 @@ class ConsensusEngine:
                 agreement_count=agreement_count, total_strategies=len(results),
                 is_valid=False,
                 reasoning=(
-                    f"Insufficient agreement: {agreement_count}/{len(results)} "
-                    f"agree on {dominant_dir} (need {MIN_AGREEMENT})"
+                    f"🚫 HARD BLOCK: {agreement_count}/4 agreement insufficient "
+                    f"(minimum 3/4 required)"
                 ),
             )
 

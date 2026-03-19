@@ -70,6 +70,22 @@ class SignalRepository:
         return [SignalRepository._row_to_signal(r) for r in rows]
 
     @staticmethod
+    def find_duplicate_recent(symbol: str, direction: str, hours: int = 4) -> List[Signal]:
+        """Find signals with same pair+direction within last N hours."""
+        rows = db.execute(
+            """
+            SELECT * FROM signals 
+            WHERE pair = %s 
+            AND direction = %s
+            AND created_at > NOW() - INTERVAL '%s hours'
+            AND status = 'PENDING'
+            ORDER BY created_at DESC
+            """,
+            (symbol, direction, str(hours)),
+        )
+        return [SignalRepository._row_to_signal(r) for r in rows]
+
+    @staticmethod
     def count_today() -> int:
         row = db.execute_one(
             "SELECT COUNT(*) AS cnt FROM signals WHERE DATE(created_at) = CURRENT_DATE"

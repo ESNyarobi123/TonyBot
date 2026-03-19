@@ -147,7 +147,20 @@ class SignalGenerator:
             )
             return None
 
-        # ── 8. Check duplicate signals ────────────────────────────────────────
+        # ── 8. Check duplicate signals (BUG FIX 3) ────────────────────────────
+        # Check if same pair+direction signal was sent in last 4 hours
+        duplicates = SignalRepository.find_duplicate_recent(
+            symbol, consensus.direction, hours=4
+        )
+        if duplicates:
+            logger.warning(
+                "🚫 DUPLICATE BLOCK: %s %s already sent in last 4 hours (id=%s). "
+                "Skipping to avoid spam!",
+                symbol, consensus.direction, duplicates[0].id
+            )
+            return None
+
+        # Also check max signals per day limit
         existing_today = SignalRepository.find_by_pair_today(symbol)
         same_direction = [
             s for s in existing_today
@@ -178,6 +191,7 @@ class SignalGenerator:
             take_profit_2=round(tp2, 5) if tp2 else None,
             take_profit_3=round(tp3, 5) if tp3 else None,
             timeframe=settings.PRIMARY_TIMEFRAME,
+            order_type="MARKET",  # BUG FIX 3: Add order type
             strategy_scores={r.strategy_name: r.score for r in results},
             consensus_score=consensus.consensus_score,
             confidence=consensus.confidence_label,

@@ -18,10 +18,11 @@ class Signal:
     take_profit_2: Optional[float]
     take_profit_3: Optional[float]
     timeframe: str
-    strategy_scores: Dict[str, int]         # {mtf: 80, smc: 90, pa: 75, tech: 85}
-    consensus_score: int                    # 0–100
-    confidence: str                         # LOW|MEDIUM|HIGH|VERY_HIGH
-    filters_passed: Dict[str, bool]
+    order_type: str = "MARKET"            # MARKET | LIMIT | STOP
+    strategy_scores: Dict[str, int] = field(default_factory=dict)
+    consensus_score: int = 0                # 0–100
+    confidence: str = "LOW"               # LOW|MEDIUM|HIGH|VERY_HIGH
+    filters_passed: Dict[str, bool] = field(default_factory=dict)
     status: str = "PENDING"                 # PENDING|WIN|LOSS|EXPIRED
     pips_result: Optional[float] = None
     sent_at: Optional[datetime] = None
@@ -40,6 +41,7 @@ class Signal:
             "take_profit_2": float(self.take_profit_2) if self.take_profit_2 else None,
             "take_profit_3": float(self.take_profit_3) if self.take_profit_3 else None,
             "timeframe": self.timeframe,
+            "order_type": self.order_type,
             "strategy_scores": self.strategy_scores,
             "consensus_score": self.consensus_score,
             "confidence": self.confidence,

@@ -66,6 +66,15 @@ class MultiTimeframeStrategy(BaseStrategy):
         # ── STEP 1: D1 Trend Direction ────────────────────────────────────────
         d1_trend, d1_score = self._d1_trend(df_d1)
 
+        # BUG FIX 2: Block counter-trend signals based on D1 trend
+        # If D1 shows STRONG_UP, block ALL SELL signals
+        # If D1 shows STRONG_DOWN, block ALL BUY signals
+        d1_direction = "BUY" if "UP" in d1_trend else "SELL" if "DOWN" in d1_trend else "NEUTRAL"
+        
+        # Store for later counter-trend check after H1 determines signal
+        self._d1_direction = d1_direction
+        self._d1_trend = d1_trend
+
         if d1_trend == "RANGING":
             return StrategyResult(
                 strategy_name=self.name,
@@ -75,8 +84,6 @@ class MultiTimeframeStrategy(BaseStrategy):
                 reasoning="D1 price is ranging between EMA50/200 — no trade",
                 metadata={"d1_trend": "RANGING", "h4_zone": "NONE", "h1_signal": "NONE"},
             )
-
-        d1_direction = "BUY" if "UP" in d1_trend else "SELL"
 
         # ── STEP 2: H4 Zone ───────────────────────────────────────────────────
         h4_zone, h4_detail = self._h4_zone(df_h4, symbol, pip_size, d1_trend)
@@ -123,6 +130,47 @@ class MultiTimeframeStrategy(BaseStrategy):
 
         # Scale by D1 strength (STRONG=100pts, WEAK=65pts → factor 0.65–1.0)
         final_score = int(raw_score * d1_score / 100)
+
+        # BUG FIX 2: HARD BLOCK counter-trend signals
+        # If D1 shows STRONG_UP trend, block ALL SELL signals
+        # If D1 shows STRONG_DOWN trend, block ALL BUY signals
+        if d1_trend == "STRONG_UP" and d1_direction == "SELL":
+            logger.warning(
+                "🚫 MTF HARD BLOCK: %s SELL rejected - D1 shows STRONG_UPTREND! "
+                "Counter-trend trading not allowed.", symbol
+            )
+            return StrategyResult(
+                strategy_name=self.name,
+                score=0,
+                direction="NEUTRAL",
+                confidence=0.0,
+                reasoning=f"🚫 BLOCKED: D1={d1_trend} → Cannot SELL in strong uptrend!",
+                metadata={
+                    "d1_trend": d1_trend,
+                    "h4_zone": h4_zone,
+                    "h1_signal": h1_signal,
+                    "blocked": "COUNTER_TREND_SELL",
+                },
+            )
+        
+        if d1_trend == "STRONG_DOWN" and d1_direction == "BUY":
+            logger.warning(
+                "🚫 MTF HARD BLOCK: %s BUY rejected - D1 shows STRONG_DOWNTREND! "
+                "Counter-trend trading not allowed.", symbol
+            )
+            return StrategyResult(
+                strategy_name=self.name,
+                score=0,
+                direction="NEUTRAL",
+                confidence=0.0,
+                reasoning=f"🚫 BLOCKED: D1={d1_trend} → Cannot BUY in strong downtrend!",
+                metadata={
+                    "d1_trend": d1_trend,
+                    "h4_zone": h4_zone,
+                    "h1_signal": h1_signal,
+                    "blocked": "COUNTER_TREND_BUY",
+                },
+            )
 
         return StrategyResult(
             strategy_name=self.name,
