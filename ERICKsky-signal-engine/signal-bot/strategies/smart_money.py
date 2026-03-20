@@ -139,8 +139,15 @@ class SmartMoneyStrategy(BaseStrategy):
         # DEBUG
         logger.info(f"SMC DEBUG {symbol}: Buy score={buy_score}, Sell score={sell_score}")
 
-        # FIX 4: Lower threshold from 40 to 25 for partial SMC signals
-        if buy_score > sell_score and buy_score >= 25:
+        # Partial scoring enhancement
+        # Give minimum 20 if any SMC element found
+        if bull_fvg or liq_bull_sweep or bull_ob:
+            buy_score = max(buy_score, 20)  # Minimum 20 if any SMC element
+        if bear_fvg or liq_bear_sweep or bear_ob:
+            sell_score = max(sell_score, 20)  # Minimum 20 if any SMC element
+
+        # FIX 4: Lower threshold from 40 to 20 for partial SMC signals
+        if buy_score > sell_score and buy_score >= 20:
             direction = "BUY"
             score     = buy_score
             active_ob  = bull_ob
@@ -149,7 +156,7 @@ class SmartMoneyStrategy(BaseStrategy):
                 f"Bullish OB={bull_ob is not None} FVG={bull_fvg is not None} "
                 f"LiqSweep={liq_bull_sweep} Struct={mkt_structure}"
             )
-        elif sell_score > buy_score and sell_score >= 25:
+        elif sell_score > buy_score and sell_score >= 20:
             direction = "SELL"
             score     = sell_score
             active_ob  = bear_ob

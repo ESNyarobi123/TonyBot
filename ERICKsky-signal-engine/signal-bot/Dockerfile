@@ -36,6 +36,9 @@ RUN adduser --disabled-password --gecos '' appuser && \
 
 USER appuser
 
+# Expose API port
+EXPOSE 8000
+
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD python -c "import redis, psycopg2; print('healthy')" || exit 1

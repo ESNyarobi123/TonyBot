@@ -21,6 +21,29 @@ services:
         max-size: "10m"
         max-file: "5"
 
+  signal-bot-api:
+    build: ./signal-bot
+    container_name: erickskybot-api
+    restart: always
+    command: uvicorn api_server:app --host 0.0.0.0 --port 8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./signal-bot/.env:/app/.env:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+      - API_PORT=8000
+    networks:
+      - erickskybot-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
   celery-worker:
     build: ./signal-bot
     container_name: erickskybot-celery
@@ -119,13 +142,14 @@ services:
     container_name: erickskybot-nginx
     restart: always
     ports:
-      - "8080:80"
-      - "8443:443"
+      - "80:80"
+      - "443:443"
     volumes:
       - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
       - ./nginx/ssl:/etc/nginx/ssl:ro
     depends_on:
       - dashboard
+      - signal-bot
     networks:
       - erickskybot-network
     logging:

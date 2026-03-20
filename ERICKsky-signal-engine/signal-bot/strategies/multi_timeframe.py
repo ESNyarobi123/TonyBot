@@ -83,8 +83,8 @@ class MultiTimeframeStrategy(BaseStrategy):
         
         # Determine direction from trend
         d1_direction = "BUY" if "UP" in d1_trend else "SELL" if "DOWN" in d1_trend else "NEUTRAL"
-        self._d1_direction = d1_direction
-        self._d1_trend = d1_trend
+        self._last_d1_direction = d1_direction
+        self._last_d1_trend = d1_trend
 
         # If still ranging after H4 fallback, return neutral
         if d1_trend == "RANGING" or d1_direction == "NEUTRAL":
@@ -99,19 +99,20 @@ class MultiTimeframeStrategy(BaseStrategy):
             )
 
         # ── STEP 2: H4 Zone ───────────────────────────────────────────────────
-        h4_zone, h4_detail = self._h4_zone(df_h4, symbol, pip_size, d1_trend)
+        h4_zone, h4_detail, h4_zone_score = self._h4_zone(df_h4, symbol, pip_size, d1_trend)
 
         # ── STEP 3: H1 Entry Trigger ──────────────────────────────────────────
         h1_signal, h1_detail = self._h1_entry(df_h1)
         
         # DEBUG: Log H4 and H1 results
-        logger.info(f"MTF DEBUG {symbol}: H4 zone={h4_zone}, H1 signal={h1_signal}")
+        logger.info(f"MTF DEBUG {symbol}: H4 zone={h4_zone}, zone_score={h4_zone_score}, H1 signal={h1_signal}")
 
         # ── Scoring ───────────────────────────────────────────────────────────
         h4_aligns = (
-            (h4_zone == "SUPPORT"    and d1_direction == "BUY")  or
-            (h4_zone == "RESISTANCE" and d1_direction == "SELL") or
-            (h4_zone == "BREAKOUT")
+            (h4_zone in ("SUPPORT", "WEAK_SUPPORT") and d1_direction == "BUY") or
+            (h4_zone in ("RESISTANCE", "WEAK_RESISTANCE") and d1_direction == "SELL") or
+            (h4_zone == "BREAKOUT") or
+            (h4_zone == "WEAK_ZONE" and h4_zone_score >= 25)
         )
         h1_aligns = h1_signal == d1_direction
 
@@ -279,56 +280,95 @@ class MultiTimeframeStrategy(BaseStrategy):
         symbol: str,
         pip_size: float,
         d1_trend: str,
-    ) -> Tuple[str, dict]:
+    ) -> Tuple[str, dict, int]:
         """
         Identify whether price is at a key H4 zone.
-
-        Algorithm:
-        - Find last 3 swing highs and last 3 swing lows
-        - Resistance = average of last 3 swing highs
-        - Support    = average of last 3 swing lows
-        - "At zone"  = within 20 pips of the level
-        - Also detect Bollinger Band squeeze breakout
+        Enhanced version with multiple detection methods and partial scoring.
         """
         if df is None or len(df) < 30:
-            return "NONE", {}
+            return "NONE", {}, 0
 
         close = df["close"]
         high  = df["high"]
         low   = df["low"]
         price = float(close.iloc[-1])
 
-        # Swing points (local extremes over 5-bar window)
+        # METHOD 1: Swing points (extended to 5 swings)
         swing_highs = self._swing_highs(high, window=5)
         swing_lows  = self._swing_lows(low,  window=5)
 
-        resistance = float(np.mean(swing_highs[-3:])) if len(swing_highs) >= 1 else None
-        support    = float(np.mean(swing_lows[-3:]))  if len(swing_lows)  >= 1 else None
+        recent_highs = swing_highs[-5:] if len(swing_highs) >= 3 else swing_highs
+        recent_lows  = swing_lows[-5:]  if len(swing_lows)  >= 3 else swing_lows
 
+        resistance = float(np.mean(recent_highs[-3:])) if len(recent_highs) >= 1 else None
+        support    = float(np.mean(recent_lows[-3:]))  if len(recent_lows)  >= 1 else None
+
+        # METHOD 2: Round number levels (psychological levels)
+        round_levels = []
+        price_range = max(high.iloc[-50:]) - min(low.iloc[-50:])
+        step = max(round(price_range / 10, 4), 0.001)
+
+        base = round(price / step) * step
+        for i in range(-3, 4):
+            round_levels.append(round(base + i * step, 5))
+
+        # METHOD 3: Previous day high/low (6 H4 candles = 1 day)
+        if len(df) >= 12:
+            prev_day_high = max(high.iloc[-12:-6])
+            prev_day_low  = min(low.iloc[-12:-6])
+            round_levels.extend([prev_day_high, prev_day_low])
+
+        # METHOD 4: Weekly levels (42 H4 candles = 7 days)
+        if len(df) >= 42:
+            weekly_high = max(high.iloc[-42:])
+            weekly_low  = min(low.iloc[-42:])
+            round_levels.extend([weekly_high, weekly_low])
+
+        # Combine all levels
+        all_levels = recent_highs + recent_lows + round_levels
+
+        # Check proximity
         prox = _ZONE_PROXIMITY_PIPS * pip_size
+        ZONE_BUFFER = 0.0015  # 15 pips extended buffer
 
-        # Bollinger squeeze overrides zone logic
+        # Bollinger squeeze check
         bb_squeeze, bb_direction = self._bb_squeeze(close)
+
         detail: dict = {
-            "support":       round(support,    5) if support    else None,
+            "support":       round(support,    5) if support else None,
             "resistance":    round(resistance, 5) if resistance else None,
             "bb_squeeze":    bb_squeeze,
             "bb_direction":  bb_direction,
+            "all_levels":    len(all_levels),
         }
 
+        # Perfect zone: Bollinger squeeze breakout
         if bb_squeeze and bb_direction in ("UP", "DOWN"):
-            return "BREAKOUT", detail
+            return "BREAKOUT", detail, 100
 
-        # Zone proximity checks aligned with D1 trend
+        # Strong zone: Price at swing high/low with D1 trend alignment
         if support and abs(price - support) <= prox:
             if "UP" in d1_trend:
-                return "SUPPORT", detail
+                return "SUPPORT", detail, 100
 
         if resistance and abs(price - resistance) <= prox:
             if "DOWN" in d1_trend:
-                return "RESISTANCE", detail
+                return "RESISTANCE", detail, 100
 
-        return "NONE", detail
+        # Extended zone: Price near any level within larger buffer
+        for level in all_levels:
+            distance = abs(price - level)
+            if distance <= ZONE_BUFFER:
+                if "UP" in d1_trend and price <= level:
+                    return "WEAK_SUPPORT", detail, 40
+                if "DOWN" in d1_trend and price >= level:
+                    return "WEAK_RESISTANCE", detail, 40
+
+        # Weak zone: At least found some levels, give partial credit
+        if len(all_levels) >= 3:
+            return "WEAK_ZONE", detail, 25
+
+        return "NONE", detail, 0
 
     def _swing_highs(self, high: pd.Series, window: int = 5) -> List[float]:
         """Return list of swing high prices (local maxima)."""

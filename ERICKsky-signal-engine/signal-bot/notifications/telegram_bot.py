@@ -101,12 +101,8 @@ class TelegramBot:
             if ok:
                 sent += 1
 
-        # 4. Notify admin
-        admin_text = (
-            f"Signal sent: {signal.pair} {signal.direction} "
-            f"@ {signal.entry_price:.5f} "
-            f"[{signal.confidence}] score={signal.consensus_score}"
-        )
+        # 4. Notify admin with full template
+        admin_text = signal_formatter.format_signal(signal, is_premium=True)
         await self._send_text_async(settings.TELEGRAM_ADMIN_CHAT_ID, admin_text)
 
         return sent
