@@ -94,6 +94,11 @@ class PriceActionStrategy(BaseStrategy):
         # ── COMPONENT 2: Candlestick Patterns (H1) ───────────────────────────
         pattern, pattern_dir = self._detect_patterns(df_h1, pip_size)
 
+        # ── COMPONENT 2b: Pattern Confluence with Zones ──────────────────────
+        confluence, pa_score = self._check_pattern_at_zone(
+            pattern, price, levels, pip_size
+        )
+
         # ── COMPONENT 3: Breakout + Retest (H1) ──────────────────────────────
         bo_retest, bo_dir = self._detect_breakout_retest(df_h1, levels, pip_size)
 
@@ -104,6 +109,7 @@ class PriceActionStrategy(BaseStrategy):
         buy_score, sell_score = self._score(
             strong_sup=strong_sup, strong_res=strong_res,
             pattern=pattern, pattern_dir=pattern_dir,
+            confluence=confluence, pa_score=pa_score,
             bo_retest=bo_retest, bo_dir=bo_dir,
             tl_dir=tl_dir,
         )
@@ -145,14 +151,71 @@ class PriceActionStrategy(BaseStrategy):
 
     # ── Scoring helper ────────────────────────────────────────────────────────
 
+    def _check_pattern_at_zone(
+        self,
+        pattern: str,
+        price: float,
+        levels: List[_SRLevel],
+        pip_size: float,
+    ) -> Tuple[str, int]:
+        """
+        Check if pattern occurs AT key zone (confluence).
+        
+        Returns:
+            confluence_type: "ZONE_CONFLUENCE", "NEAR_ZONE", or "NO_CONFLUENCE"
+            score: 100 (at zone), 50-70 (near zone), 20-30 (no confluence)
+        """
+        if pattern == "NONE" or pattern is None:
+            return "NO_PATTERN", 0
+            
+        ZONE_BUFFER = 0.0015  # 15 pips
+        NEAR_BUFFER = 0.0030  # 30 pips (near but not at)
+        
+        # Extract support and resistance levels
+        support_levels = [level.price for level in levels if level.zone_type == "SUPPORT"]
+        resistance_levels = [level.price for level in levels if level.zone_type == "RESISTANCE"]
+        
+        # Bullish patterns at support = STRONG BUY
+        bullish_patterns = ["HAMMER", "BULL_ENGULFING", "MORNING_STAR", "BULL_PINBAR"]
+        if pattern in bullish_patterns:
+            for level in support_levels:
+                distance = abs(price - level)
+                if distance <= ZONE_BUFFER:
+                    logger.info(f"PA: {pattern} at SUPPORT zone ({level}) - STRONG BUY! Score=100")
+                    return "ZONE_CONFLUENCE", 100
+                elif distance <= NEAR_BUFFER:
+                    logger.info(f"PA: {pattern} NEAR support zone ({level}) - MODERATE BUY. Score=60")
+                    return "NEAR_ZONE", 60
+            # Pattern exists but not at zone
+            logger.info(f"PA: {pattern} but NOT at support zone - WEAK. Score=30")
+            return "NO_CONFLUENCE", 30
+        
+        # Bearish patterns at resistance = STRONG SELL
+        bearish_patterns = ["SHOOTING_STAR", "BEAR_ENGULFING", "EVENING_STAR", "BEAR_PINBAR"]
+        if pattern in bearish_patterns:
+            for level in resistance_levels:
+                distance = abs(price - level)
+                if distance <= ZONE_BUFFER:
+                    logger.info(f"PA: {pattern} at RESISTANCE zone ({level}) - STRONG SELL! Score=100")
+                    return "ZONE_CONFLUENCE", 100
+                elif distance <= NEAR_BUFFER:
+                    logger.info(f"PA: {pattern} NEAR resistance zone ({level}) - MODERATE SELL. Score=60")
+                    return "NEAR_ZONE", 60
+            # Pattern exists but not at zone
+            logger.info(f"PA: {pattern} but NOT at resistance zone - WEAK. Score=30")
+            return "NO_CONFLUENCE", 30
+        
+        return "NO_CONFLUENCE", 25
+
     def _score(
         self,
         strong_sup: bool, strong_res: bool,
         pattern: str, pattern_dir: str,
+        confluence: str, pa_score: int,
         bo_retest: bool, bo_dir: str,
         tl_dir: str,
     ) -> Tuple[int, int]:
-        """Return (buy_score, sell_score) based on component signals."""
+        """Return (buy_score, sell_score) based on component signals with zone confluence."""
         buy  = 0
         sell = 0
 
@@ -162,22 +225,28 @@ class PriceActionStrategy(BaseStrategy):
         elif bo_retest and bo_dir == "SELL":
             sell += 50
 
-        # Strong level + pattern
+        # NEW: Pattern confluence scoring (replaces old pattern scoring)
+        if pattern_dir == "BUY":
+            if confluence == "ZONE_CONFLUENCE":
+                buy += 100  # Pattern AT zone = banks wameingia!
+            elif confluence == "NEAR_ZONE":
+                buy += 60   # Pattern NEAR zone
+            elif confluence == "NO_CONFLUENCE":
+                buy += 30   # Pattern bila zone = weak
+        
+        if pattern_dir == "SELL":
+            if confluence == "ZONE_CONFLUENCE":
+                sell += 100  # Pattern AT zone
+            elif confluence == "NEAR_ZONE":
+                sell += 60   # Pattern NEAR zone
+            elif confluence == "NO_CONFLUENCE":
+                sell += 30   # Pattern bila zone
+
+        # Strong level bonus (in addition to pattern)
         if strong_sup and pattern_dir == "BUY":
-            buy  += 35
-        elif strong_sup:
-            buy  += 20
-
+            buy  += 20  # Extra for strong support
         if strong_res and pattern_dir == "SELL":
-            sell += 35
-        elif strong_res:
-            sell += 20
-
-        # Pattern alone
-        if pattern_dir == "BUY"  and not strong_sup:
-            buy  += 20
-        if pattern_dir == "SELL" and not strong_res:
-            sell += 20
+            sell += 20  # Extra for strong resistance
 
         # Trendline direction
         if tl_dir == "UP":

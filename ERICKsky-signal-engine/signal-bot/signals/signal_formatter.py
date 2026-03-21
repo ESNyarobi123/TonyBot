@@ -108,8 +108,9 @@ class SignalFormatter:
         emoji   = _DIR_EMOJI.get(direction, "⚪")
         stars   = _CONF_STARS.get(signal.confidence or "LOW", "⭐")
         
-        # Calculate valid until time (4 hours from signal creation)
-        valid_until = signal.sent_at + timedelta(minutes=settings.SIGNAL_VALID_MINUTES)
+        # Calculate valid until time (using entry_window_minutes if available)
+        window_minutes = getattr(signal, 'entry_window_minutes', 90)
+        valid_until = signal.sent_at + timedelta(minutes=window_minutes)
         valid_str = valid_until.strftime("%H:%M UTC")
         
         # Price formatting: all pairs use 5 decimals now
@@ -121,6 +122,32 @@ class SignalFormatter:
         tp2   = float(signal.take_profit_2) if signal.take_profit_2 else None
         tp3   = float(signal.take_profit_3) if signal.take_profit_3 else None
 
+        # Smart entry values (new fields) - with fallback calculation
+        limit_entry = getattr(signal, 'limit_entry', None)
+        entry_zone_low = getattr(signal, 'entry_zone_low', None)
+        entry_zone_high = getattr(signal, 'entry_zone_high', None)
+        market_entry = getattr(signal, 'market_entry', entry)
+        atr_value = getattr(signal, 'atr_value', None)
+
+        # Fallback: calculate smart entry if fields are missing OR limit equals entry
+        if (limit_entry is None or limit_entry == entry) and atr_value:
+            if direction == "BUY":
+                limit_entry = round(entry - (atr_value * 0.40), 5)
+                entry_zone_low = round(entry - (atr_value * 0.5), 5)
+                entry_zone_high = round(entry + (atr_value * 0.1), 5)
+            else:  # SELL
+                limit_entry = round(entry + (atr_value * 0.40), 5)
+                entry_zone_low = round(entry - (atr_value * 0.1), 5)
+                entry_zone_high = round(entry + (atr_value * 0.5), 5)
+        
+        # Ultimate fallback: use hardcoded ATR if atr_value is missing
+        if limit_entry is None or limit_entry == entry:
+            atr = 0.0015  # Default ATR ~15 pips
+            if direction == "BUY":
+                limit_entry = round(entry - (atr * 0.40), 5)
+            else:  # SELL
+                limit_entry = round(entry + (atr * 0.40), 5)
+
         # Pip calculations
         sl_pips  = abs(entry - sl) / pip_size
         tp1_pips = abs(tp1 - entry) / pip_size
@@ -130,45 +157,129 @@ class SignalFormatter:
         sl_sign  = "-" if direction == "BUY" else "+"
         tp_sign  = "+" if direction == "BUY" else "-"
 
-        # Get agreement count from strategy_scores
-        strategy_scores = signal.strategy_scores or {}
-        agreeing = sum(1 for score in strategy_scores.values() if score > 50)
-        total_strategies = len(strategy_scores) if strategy_scores else 4
+        # Use agreement_count directly from consensus result
+        agreement = signal.agreement_count or 0
+        total_strategies = len(signal.strategy_scores) if signal.strategy_scores else 4
 
         # Build the professional template
         lines = [
-            f"� *PREMIUM SIGNAL* 🔥",
+            f"🔥 *PREMIUM SIGNAL* 🔥",
             f"",
             f"┌─────────────────────────┐",
             f"│  {emoji} *{pair} — {direction}*",
             f"│  Score: {signal.consensus_score} | {signal.confidence} {stars}",
             f"└─────────────────────────┘",
             f"",
-            f"💵 *Entry:*   `{fmt.format(entry)}`",
-            f"� *SL:*      `{fmt.format(sl)}` ({sl_sign}{sl_pips:.0f} pips)",
-            f"🟢 *TP1:*     `{fmt.format(tp1)}` ({tp_sign}{tp1_pips:.0f} pips)",
+            f"💰 *TRADE SETUP:*",
+        ]
+        
+        # Entry zone or single entry
+        if entry_zone_low and entry_zone_high:
+            lines.append(f"├ Entry Zone: `{fmt.format(entry_zone_low)}` – `{fmt.format(entry_zone_high)}`")
+        else:
+            lines.append(f"├ Entry:     `{fmt.format(entry)}`")
+            
+        lines += [
+            f"├ Stop Loss:  `{fmt.format(sl)}` ({sl_sign}{sl_pips:.0f} pips)",
+            f"├ TP1:        `{fmt.format(tp1)}` ({tp_sign}{tp1_pips:.0f} pips)",
         ]
 
         if tp2:
-            lines.append(f"🟢 *TP2:*     `{fmt.format(tp2)}` ({tp_sign}{tp2_pips:.0f} pips)")
+            lines.append(f"├ TP2:        `{fmt.format(tp2)}` ({tp_sign}{tp2_pips:.0f} pips)")
 
         if tp3:
-            lines.append(f"🟢 *TP3:*     `{fmt.format(tp3)}` ({tp_sign}{tp3_pips:.0f} pips)")
+            lines.append(f"└ TP3:        `{fmt.format(tp3)}` ({tp_sign}{tp3_pips:.0f} pips)")
+        else:
+            lines[-1] = lines[-1].replace("├", "└")
 
+        # SMART ENTRY GUIDE section - always show with calculated or fallback values
         lines += [
             f"",
-            f"🧠 *Strategies zinakubaliana:* {agreeing}/{total_strategies}",
-            f"━━━━━━━━━━━━━━━━━━━━━",
+            f"📌 *SMART ENTRY GUIDE:*",
+            f"┌─────────────────────────────────┐",
+        ]
+        
+        # Determine action and rules based on direction
+        if direction == "BUY":
+            action = "BUY LIMIT"
+            candle_rule = "closes bullish ↑"
+            avoid_msg = "chasing price up!"
+        else:
+            action = "SELL LIMIT"
+            candle_rule = "closes bearish ↓"
+            avoid_msg = "chasing price down!"
+
+        # Format prices for display
+        if limit_entry:
+            limit_str = fmt.format(limit_entry)
+            zone_str = f"{fmt.format(entry_zone_low)} – {fmt.format(entry_zone_high)}" if entry_zone_low and entry_zone_high else "See entry zone above"
+        else:
+            # Ultimate fallback - use entry price
+            limit_str = fmt.format(entry)
+            zone_str = "Use entry price above"
+        
+        # Build box content
+        lines += [
+            f"│ ⭐ BEST:  {action} {limit_str}",
+            f"│    (Wait for pullback here!)    │",
+            f"│                                 │",
+            f"│ ✅ OK:    Wait H1 candle close  │",
+            f"│    Enter if candle {candle_rule} │",
+            f"│                                 │",
+            f"│ ❌ AVOID: Market order now!     │",
+            f"│    Never {avoid_msg}   │",
+            f"└─────────────────────────────────┘",
+        ]
+        
+        # Entry rules section
+        lines += [
+            f"",
+            f"⚠️ *ENTRY RULES:*",
+            f"- Wait for pullback to zone first",
+            f"- Enter ONLY if candle closes {direction.lower()}",
+            f"- Place limit order – don't chase!",
+            f"- Valid for next {window_minutes} minutes only",
+            f"",
+            f"📊 *Why limit entry?*",
+            f"Banks sweep stops BEFORE moving!",
+            f"Wait for the dip = safer SL + better RR",
+            f"",
+            f"🧠 *Strategies zinakubaliana:* {agreement}/{total_strategies}",
         ]
 
         # Strategy breakdown with checkmarks
+        strategy_scores = signal.strategy_scores or {}
         if strategy_scores:
             strategy_lines = []
+            
+            # Define a helper function to get icon
+            def _get_icon(strat_dir, sig_dir, score):
+                if score == 0 or strat_dir == "NEUTRAL":
+                    return "⬜"
+                elif strat_dir == sig_dir:
+                    return "✅"
+                else:
+                    return "⚠️"
+            
             for name, score in strategy_scores.items():
                 short_name = _STRATEGY_SHORT.get(name, name[:4])
                 emoji = _STRATEGY_EMOJI.get(name, "📊")
-                # Checkmark if score > 50 (agrees with direction)
-                check = "✅" if score >= 50 else "❌"
+                
+                # Get individual direction from signal fields
+                if name == "MultiTimeframe":
+                    strategy_dir = getattr(signal, 'mtf_direction', "NEUTRAL")
+                elif name == "SmartMoney":
+                    strategy_dir = getattr(signal, 'smc_direction', "NEUTRAL")
+                elif name == "PriceAction":
+                    strategy_dir = getattr(signal, 'pa_direction', "NEUTRAL")
+                elif name == "TechnicalIndicators":
+                    strategy_dir = getattr(signal, 'tech_direction', "NEUTRAL")
+                else:
+                    strategy_dir = signal.strategy_directions.get(name) if signal.strategy_directions else None
+                
+                # Checkmark based on whether strategy direction matches signal direction
+                check = _get_icon(strategy_dir, signal.direction, score)
+                    
                 bar = self._score_bar(int(score))
                 strategy_lines.append(f"{emoji} *{short_name}:* {check} | {bar} {score}")
             
@@ -181,12 +292,8 @@ class SignalFormatter:
 
         lines += [
             f"━━━━━━━━━━━━━━━━━━━━━",
-            f"",
-            f"⚙️ *Timeframe:* H1",
-            f"📌 *Order Type:* {signal.order_type} (enter now)",
-            f"⏰ *Valid:*    Until {valid_str}",
-            f"💰 *Risk:*     1% max per trade",
-            f"",
+            f"⏰ *Valid Until:* {valid_str}",
+            f"💰 *Risk:* 1% max per trade",
             f"━━━━━━━━━━━━━━━━━━━━━",
             f"🏆 *ERICKsky Signal Engine*",
             f"📱 t.me/ERICKskySignals",

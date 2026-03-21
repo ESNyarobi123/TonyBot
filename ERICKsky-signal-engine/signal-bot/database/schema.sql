@@ -17,6 +17,8 @@ CREATE TABLE IF NOT EXISTS signals (
     take_profit_3     DECIMAL(10, 5),
     timeframe         VARCHAR(5)      NOT NULL,
     strategy_scores   JSONB           NOT NULL DEFAULT '{}',
+    strategy_directions JSONB         NOT NULL DEFAULT '{}',
+    agreement_count   INTEGER         NOT NULL DEFAULT 0,
     consensus_score   INTEGER         NOT NULL CHECK (consensus_score BETWEEN 0 AND 100),
     confidence        VARCHAR(10)     NOT NULL CHECK (confidence IN ('LOW', 'MEDIUM', 'HIGH', 'VERY_HIGH')),
     filters_passed    JSONB           NOT NULL DEFAULT '{}',

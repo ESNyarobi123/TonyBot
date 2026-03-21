@@ -25,13 +25,13 @@ class SignalRepository:
             INSERT INTO signals (
                 pair, direction, entry_price, stop_loss,
                 take_profit_1, take_profit_2, take_profit_3,
-                timeframe, strategy_scores, consensus_score,
-                confidence, filters_passed, status, sent_at
+                timeframe, strategy_scores, strategy_directions, agreement_count,
+                consensus_score, confidence, filters_passed, status, sent_at
             ) VALUES (
                 %s, %s, %s, %s,
                 %s, %s, %s,
-                %s, %s::jsonb, %s,
-                %s, %s::jsonb, %s, %s
+                %s, %s::jsonb, %s::jsonb, %s,
+                %s, %s, %s::jsonb, %s, %s
             ) RETURNING id
         """
         params = (
@@ -39,6 +39,8 @@ class SignalRepository:
             signal.take_profit_1, signal.take_profit_2, signal.take_profit_3,
             signal.timeframe,
             json.dumps(signal.strategy_scores),
+            json.dumps(signal.strategy_directions) if signal.strategy_directions else '{}',
+            signal.agreement_count or 0,
             signal.consensus_score,
             signal.confidence,
             json.dumps(signal.filters_passed),
@@ -46,7 +48,7 @@ class SignalRepository:
             signal.sent_at or datetime.utcnow(),
         )
         signal_id = db.execute_write(query, params)
-        logger.info("Signal saved: id=%s %s %s", signal_id, signal.pair, signal.direction)
+        logger.info("Signal saved: id=%s %s %s agreement=%s/4", signal_id, signal.pair, signal.direction, signal.agreement_count or 0)
         return signal_id
 
     @staticmethod
@@ -128,6 +130,8 @@ class SignalRepository:
             take_profit_3=float(row["take_profit_3"]) if row.get("take_profit_3") else None,
             timeframe=row["timeframe"],
             strategy_scores=row["strategy_scores"] or {},
+            strategy_directions=row.get("strategy_directions") or {},
+            agreement_count=row.get("agreement_count") or 0,
             consensus_score=row["consensus_score"],
             confidence=row["confidence"],
             filters_passed=row["filters_passed"] or {},

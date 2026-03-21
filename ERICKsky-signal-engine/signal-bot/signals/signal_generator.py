@@ -177,11 +177,43 @@ class SignalGenerator:
         if not current_price:
             current_price = float(primary_df["close"].iloc[-1])
 
-        entry, sl, tp1, tp2, tp3 = self._calculate_levels(
+        entry, sl, tp1, tp2, tp3, atr = self._calculate_levels(
             symbol, consensus.direction, current_price, primary_df
         )
 
+        # ── 9b. Calculate Smart Entry (NEW) ────────────────────────────────
+        smart_entry = self._calculate_smart_entry(
+            consensus.direction, entry, atr, symbol
+        )
+        
+        # Debug logging for smart entry
+        logger.info(
+            f"Smart entry: entry={entry:.5f} limit={smart_entry['limit_entry']:.5f} "
+            f"atr={atr:.5f} zone_low={smart_entry['entry_zone_low']:.5f} "
+            f"zone_high={smart_entry['entry_zone_high']:.5f}"
+        )
+
         # ── 10. Build Signal object ────────────────────────────────────────────
+        # Get individual strategy directions for debugging
+        strategy_dirs = consensus.strategy_directions if consensus.strategy_directions else {}
+        logger.info(f"Strategy directions: {strategy_dirs}")
+        
+        # Map individual strategy directions from results
+        mtf_dir = "NEUTRAL"
+        smc_dir = "NEUTRAL"
+        pa_dir = "NEUTRAL"
+        tech_dir = "NEUTRAL"
+        
+        for r in results:
+            if r.strategy_name == "MultiTimeframe":
+                mtf_dir = r.direction
+            elif r.strategy_name == "SmartMoney":
+                smc_dir = r.direction
+            elif r.strategy_name == "PriceAction":
+                pa_dir = r.direction
+            elif r.strategy_name == "TechnicalIndicators":
+                tech_dir = r.direction
+        
         signal = Signal(
             pair=symbol,
             direction=consensus.direction,
@@ -191,13 +223,29 @@ class SignalGenerator:
             take_profit_2=round(tp2, 5) if tp2 else None,
             take_profit_3=round(tp3, 5) if tp3 else None,
             timeframe=settings.PRIMARY_TIMEFRAME,
-            order_type="MARKET",  # BUG FIX 3: Add order type
+            order_type="LIMIT",  # Changed to LIMIT for smart entry
             strategy_scores={r.strategy_name: r.score for r in results},
+            strategy_directions=consensus.strategy_directions,
+            agreement_count=consensus.agreement_count,
             consensus_score=consensus.consensus_score,
             confidence=consensus.confidence_label,
             filters_passed=filters_passed,
             status="PENDING",
             sent_at=datetime.now(timezone.utc),
+            # Smart Entry Fields (NEW)
+            market_entry=smart_entry["market_entry"],
+            limit_entry=smart_entry["limit_entry"],
+            entry_zone_high=smart_entry["entry_zone_high"],
+            entry_zone_low=smart_entry["entry_zone_low"],
+            entry_recommendation=smart_entry["entry_recommendation"],
+            candle_confirmation=smart_entry["candle_confirmation"],
+            entry_window_minutes=smart_entry["entry_window_minutes"],
+            atr_value=smart_entry["atr_value"],
+            # Individual strategy directions (NEW)
+            mtf_direction=mtf_dir,
+            smc_direction=smc_dir,
+            pa_direction=pa_dir,
+            tech_direction=tech_dir,
         )
 
         logger.info(
@@ -213,7 +261,7 @@ class SignalGenerator:
         entry_price: float,
         df: pd.DataFrame,
     ) -> tuple:
-        """Calculate SL and TP levels using ATR."""
+        """Calculate SL and TP levels using ATR. Returns (entry, sl, tp1, tp2, tp3, atr)."""
         from config.settings import PIP_VALUES
 
         pip_size = PIP_VALUES.get(symbol.upper(), 0.0001)
@@ -243,7 +291,57 @@ class SignalGenerator:
             tp2 = entry_price - sl_distance * settings.TP2_MULTIPLIER
             tp3 = entry_price - sl_distance * settings.TP3_MULTIPLIER
 
-        return entry_price, sl, tp1, tp2, tp3
+        return entry_price, sl, tp1, tp2, tp3, atr
+
+    def _calculate_smart_entry(
+        self,
+        direction: str,
+        entry_price: float,
+        atr: float,
+        symbol: str,
+    ) -> dict:
+        """
+        Calculate optimal limit entry zone to avoid stop hunts.
+        
+        TIER 1: LIMIT ENTRY (Primary - Safest)
+        - For BUY: Place limit below market (atr * 0.35)
+        - For SELL: Place limit above market (atr * 0.35)
+        
+        This is where banks often finish their stop hunt before going in true direction.
+        """
+        pip = 0.0001  # Standard pip size
+        
+        if direction == "BUY":
+            # Optimal limit entry (below market for pullback)
+            limit_entry = round(entry_price - (atr * 0.35), 5)
+            # Entry zone (acceptable range)
+            entry_zone_low = round(entry_price - (atr * 0.5), 5)
+            entry_zone_high = round(entry_price + (atr * 0.1), 5)
+            recommendation = (
+                f"Place BUY LIMIT at {limit_entry}\n"
+                f"Or wait for pullback to zone:\n"
+                f"{entry_zone_low} – {entry_zone_high}"
+            )
+        else:  # SELL
+            limit_entry = round(entry_price + (atr * 0.35), 5)
+            entry_zone_low = round(entry_price - (atr * 0.1), 5)
+            entry_zone_high = round(entry_price + (atr * 0.5), 5)
+            recommendation = (
+                f"Place SELL LIMIT at {limit_entry}\n"
+                f"Or wait for rally to zone:\n"
+                f"{entry_zone_low} – {entry_zone_high}"
+            )
+        
+        return {
+            "market_entry": round(entry_price, 5),
+            "limit_entry": limit_entry,
+            "entry_zone_high": entry_zone_high,
+            "entry_zone_low": entry_zone_low,
+            "entry_recommendation": recommendation,
+            "entry_window_minutes": 90,
+            "candle_confirmation": True,
+            "atr_value": atr,
+        }
 
 
 # Module-level singleton

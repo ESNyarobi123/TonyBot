@@ -126,12 +126,14 @@ class SmartMoneyStrategy(BaseStrategy):
 
         # ── Scoring ───────────────────────────────────────────────────────────
         buy_score  = self._compute_score(
-            ob=bull_ob, fvg=bull_fvg, liq_sweep=liq_bull_sweep,
+            ob=bull_ob, ob_count=len(obs_bull),
+            fvg=bull_fvg, liq_sweep=liq_bull_sweep,
             structure=mkt_structure, direction="BUY",
             price=price, pip_size=pip_size,
         )
         sell_score = self._compute_score(
-            ob=bear_ob, fvg=bear_fvg, liq_sweep=liq_bear_sweep,
+            ob=bear_ob, ob_count=len(obs_bear),
+            fvg=bear_fvg, liq_sweep=liq_bear_sweep,
             structure=mkt_structure, direction="SELL",
             price=price, pip_size=pip_size,
         )
@@ -203,6 +205,7 @@ class SmartMoneyStrategy(BaseStrategy):
     def _compute_score(
         self,
         ob: Optional[_OrderBlock],
+        ob_count: int,
         fvg: Optional[_FVG],
         liq_sweep: bool,
         structure: str,
@@ -213,33 +216,32 @@ class SmartMoneyStrategy(BaseStrategy):
         """Accumulate score for one direction from all SMC components."""
         score = 0
 
-        # Order Block
+        # FIX 1: Order Block scoring - even if price hasn't reached it
+        # Score if OBs EXIST (above or below price)
+        if ob_count >= 2:
+            score += 20  # OBs exist nearby (below for bullish, above for bearish)
+        elif ob_count >= 1:
+            score += 10  # At least one OB exists
+            
+        # Bonus if price IS AT or NEAR the OB
         if ob:
-            ob_mid  = (ob.high + ob.low) / 2
-            ob_dist = abs(price - ob_mid) / pip_size
-            if ob_dist <= 20:
-                score += 40   # price at OB — high confidence
-            elif ob_dist <= 50:
-                score += 20   # price approaching OB
-            # Price inside the OB zone = extra bonus
-            if ob.low <= price <= ob.high:
-                score += 10
+            score += 20   # price at OB — full bonus
 
-        # Fair Value Gap
+        # FIX 3: Fair Value Gap - stronger weight
         if fvg:
-            if fvg.bottom <= price <= fvg.top:
-                score += 30   # price currently inside FVG = magnet zone
-            else:
-                score += 15   # unfilled FVG nearby as target/support
+            score += 25   # FVGs are strong SMC signals
 
-        # Liquidity sweep — strong reversal signal
+        # FIX 4: Liquidity sweep - stronger signal (Banks entered!)
         if liq_sweep:
-            score += 25
+            score += 20  # Strong reversal signal
 
-        # Market structure alignment
+        # FIX 2: Market structure alignment - stronger weight
         if (direction == "BUY"  and structure == "BULLISH") or \
            (direction == "SELL" and structure == "BEARISH"):
-            score += 15
+            score += 20  # Aligned with structure
+        elif structure == "RANGING":
+            # Still give partial in ranging markets
+            score += 5
 
         return min(100, score)
 

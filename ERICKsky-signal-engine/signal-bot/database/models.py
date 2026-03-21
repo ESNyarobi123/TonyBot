@@ -20,6 +20,8 @@ class Signal:
     timeframe: str
     order_type: str = "MARKET"            # MARKET | LIMIT | STOP
     strategy_scores: Dict[str, int] = field(default_factory=dict)
+    strategy_directions: Dict[str, str] = field(default_factory=dict)
+    agreement_count: int = 0
     consensus_score: int = 0                # 0–100
     confidence: str = "LOW"               # LOW|MEDIUM|HIGH|VERY_HIGH
     filters_passed: Dict[str, bool] = field(default_factory=dict)
@@ -29,6 +31,22 @@ class Signal:
     closed_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
     id: Optional[int] = None
+
+    # Smart Entry Fields (NEW)
+    market_entry: Optional[float] = None
+    limit_entry: Optional[float] = None
+    entry_zone_high: Optional[float] = None
+    entry_zone_low: Optional[float] = None
+    entry_recommendation: str = ""
+    candle_confirmation: bool = False
+    entry_window_minutes: int = 90
+    atr_value: Optional[float] = None
+
+    # Individual strategy directions (NEW - for icon display)
+    mtf_direction: str = "NEUTRAL"
+    smc_direction: str = "NEUTRAL"
+    pa_direction: str = "NEUTRAL"
+    tech_direction: str = "NEUTRAL"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
