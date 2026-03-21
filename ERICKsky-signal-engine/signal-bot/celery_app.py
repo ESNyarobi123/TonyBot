@@ -1,6 +1,11 @@
 """
-ERICKsky Signal Engine - Celery Application
-Configures the Celery app with Redis broker and beat schedule.
+ERICKsky Signal Engine - Celery Application  (v2 — Institutional Grade)
+
+Adds new periodic tasks:
+  • update-news-weekly        — Sunday 20:00 UTC (local news DB refresh)
+  • weekly-performance-analysis — Sunday 21:00 UTC (self-learning engine)
+
+Task routing updated for new tasks.
 """
 
 from celery import Celery
@@ -15,6 +20,8 @@ celery_app = Celery(
     include=[
         "tasks.scan_pair",
         "tasks.daily_report",
+        "tasks.news_updater",
+        "tasks.performance_analyzer",
     ],
 )
 
@@ -25,40 +32,56 @@ celery_app.conf.update(
     timezone=settings.CELERY_TIMEZONE,
     enable_utc=settings.CELERY_ENABLE_UTC,
 
-    # Task routing
+    # ── Task routing ──────────────────────────────────────────────────────────
     task_routes={
-        "tasks.scan_pair": {"queue": "signals"},
-        "tasks.scan_all_pairs": {"queue": "default"},
-        "tasks.daily_report": {"queue": "default"},
-        "tasks.expire_old_signals": {"queue": "default"},
+        "tasks.scan_pair":                   {"queue": "signals"},
+        "tasks.scan_all_pairs":              {"queue": "default"},
+        "tasks.daily_report":                {"queue": "default"},
+        "tasks.expire_old_signals":          {"queue": "default"},
+        "tasks.update_news_database":        {"queue": "default"},
+        "tasks.weekly_performance_analysis": {"queue": "default"},
     },
 
-    # Worker settings
+    # ── Worker settings ───────────────────────────────────────────────────────
     worker_prefetch_multiplier=1,
     task_acks_late=True,
     worker_max_tasks_per_child=100,
 
-    # Result expiry
+    # ── Result expiry ─────────────────────────────────────────────────────────
     result_expires=3600,
 
-    # Beat schedule (periodic tasks)
+    # ── Beat schedule (periodic tasks) ───────────────────────────────────────
     beat_schedule={
         # Scan all pairs every hour during active sessions
         "scan-all-pairs-hourly": {
-            "task": "tasks.scan_all_pairs",
-            "schedule": crontab(minute=0),   # top of every hour
-            "args": [],
+            "task":   "tasks.scan_all_pairs",
+            "schedule": crontab(minute=0),       # top of every hour
+            "args":   [],
             "kwargs": {"force_session": False},
         },
-        # Daily report at 21:30 UTC (NY session close)
+
+        # Daily performance report at 21:30 UTC (NY session close)
         "daily-report": {
-            "task": "tasks.daily_report",
+            "task":     "tasks.daily_report",
             "schedule": crontab(hour=21, minute=30),
         },
+
         # Expire stale pending signals every 30 minutes
         "expire-old-signals": {
-            "task": "tasks.expire_old_signals",
+            "task":     "tasks.expire_old_signals",
             "schedule": crontab(minute="*/30"),
+        },
+
+        # ── NEW: Refresh local news DB every Sunday at 20:00 UTC ─────────────
+        "update-news-weekly": {
+            "task":     "tasks.update_news_database",
+            "schedule": crontab(hour=20, minute=0, day_of_week="sunday"),
+        },
+
+        # ── NEW: Run self-learning performance analysis every Sunday 21:00 UTC
+        "weekly-performance-analysis": {
+            "task":     "tasks.weekly_performance_analysis",
+            "schedule": crontab(hour=21, minute=0, day_of_week="sunday"),
         },
     },
 )

@@ -1,22 +1,25 @@
 """
-ERICKsky Signal Engine - Celery Task: Scan Pair
+ERICKsky Signal Engine - Celery Task: Scan Pair  (v2 — Institutional Grade)
 
-Exact scan flow with ordered fast-fail filters:
+Full 15-step pipeline with all upgrades integrated:
 
-  1.  Trading session check    — only scan during London/NY/Tokyo overlap
-  2.  Spread filter            — skip if spread > max_pips for the pair
-  3.  News filter              — skip if high-impact news within ±30 min
-  4.  Volatility filter        — skip if ATR < minimum threshold
-  5a. MultiTimeframe strategy  ─┐
-  5b. SmartMoney strategy       ├─ run all 4 in parallel
-  5c. PriceAction strategy      │
-  5d. TechnicalIndicators strat ┘
-  6.  Consensus Engine         — 3/4 vote + score >= 75
-  7.  Signal validation        — price logic, R:R >= 1.5
-  8.  Dispatch                 — save to DB + Telegram
+  1.  Risk Manager          — daily/pair/consecutive-loss limits
+  2.  Trading Session       — weekday check
+  3.  News Filter           — local DB (fast), API fallback
+  4.  Data Fetch            — D1 / H4 / H1 / M15
+  5.  Spread Filter         — skip if spread > threshold
+  6.  Market Regime         — TRENDING/RANGING/VOLATILE gate
+  7.  Consolidation Filter  — tight range detection
+  8.  Four Core Strategies  — MTF / SMC / PA / TECH
+  9.  Consensus Engine      — 3/4 agreement + score threshold
+  10. Session Strength      — dynamic min-score adjustment
+  11. Chart Patterns        — confirm or veto via pattern score
+  12. M15 Confirmation      — precise entry timing
+  13. Correlation Filter    — block double-risk correlated pairs
+  14. Volatility Filter     — ATR minimum gate
+  15. Save + Dispatch       — DB insert + Telegram
 
-Each filter step returns early with {"status": "filtered", "reason": ...}
-so expensive operations (API calls, strategy computation) are skipped.
+Each step short-circuits early to avoid expensive downstream work.
 """
 
 import logging
@@ -26,31 +29,46 @@ from typing import Dict, Optional
 from celery_app import celery_app
 from config import settings
 from data.twelve_data import twelve_data
+from database.models import Signal
+from database.repositories import BotStateRepository
+
+# ── Filters ────────────────────────────────────────────────────────────────────
 from filters.session_filter import session_filter
-from filters.spread_filter import spread_filter
 from filters.news_filter import news_filter
+from filters.spread_filter import spread_filter
 from filters.volatility_filter import volatility_filter
+from filters.market_regime import market_regime_detector
+from filters.consolidation_filter import consolidation_filter
+from filters.correlation_filter import correlation_filter
+from filters.session_analyzer import session_strength_analyzer
+
+# ── Strategies ─────────────────────────────────────────────────────────────────
 from strategies.multi_timeframe import MultiTimeframeStrategy
 from strategies.smart_money import SmartMoneyStrategy
 from strategies.price_action import PriceActionStrategy
 from strategies.technical import TechnicalStrategy
 from strategies.consensus_engine import ConsensusEngine
+from strategies.chart_patterns import chart_pattern_detector
+from strategies.m15_confirmation import m15_confirmation
+
+# ── Signal pipeline ────────────────────────────────────────────────────────────
 from signals.signal_validator import signal_validator
 from notifications.notification_manager import notification_manager
-from database.models import Signal
-from database.repositories import BotStateRepository
+
+# ── Risk manager ───────────────────────────────────────────────────────────────
+from utils.risk_manager import risk_manager
 
 logger = logging.getLogger(__name__)
 
-# ── Module-level singletons (instantiated once per worker process) ─────────────
-_mtf_strategy   = MultiTimeframeStrategy()
-_smc_strategy   = SmartMoneyStrategy()
-_pa_strategy    = PriceActionStrategy()
-_tech_strategy  = TechnicalStrategy()
-_consensus      = ConsensusEngine()
+# ── Module-level strategy singletons ─────────────────────────────────────────
+_mtf_strategy  = MultiTimeframeStrategy()
+_smc_strategy  = SmartMoneyStrategy()
+_pa_strategy   = PriceActionStrategy()
+_tech_strategy = TechnicalStrategy()
+_consensus     = ConsensusEngine()
 
-# Timeframes to fetch per scan (D1/H4/H1 for strategies)
-_TIMEFRAMES = ["D1", "H4", "H1"]
+# Timeframes to fetch per scan
+_TIMEFRAMES = ["D1", "H4", "H1", "M15"]
 
 
 @celery_app.task(
@@ -69,12 +87,12 @@ def scan_pair(
     force_filters: bool = False,
 ) -> Dict:
     """
-    Celery task — run the full signal pipeline for a single trading pair.
+    Celery task — run the full 15-step institutional-grade signal pipeline.
 
     Args:
-        symbol:        e.g. "EURUSD"
-        force_session: bypass trading session time filter (for testing)
-        force_filters: bypass spread/news/volatility filters (for testing)
+        symbol:        Trading pair, e.g. "EURUSD"
+        force_session: bypass trading-session time filter (for testing)
+        force_filters: bypass spread / news / volatility filters (for testing)
 
     Returns:
         Result dict with status and signal details.
@@ -83,71 +101,123 @@ def scan_pair(
     start_ts = datetime.now(timezone.utc)
 
     try:
-        # ── FAST-FAIL FILTER 1: Trading Session ───────────────────────────────
+        # ══════════════════════════════════════════════════════════════════════
+        # STEP 1: Risk Manager (fastest check — no I/O except DB)
+        # ══════════════════════════════════════════════════════════════════════
+        if not force_filters:
+            risk_ok, risk_reason = risk_manager.check_limits(symbol)
+            if not risk_ok:
+                logger.info("[scan_pair] %s RISK BLOCKED: %s", symbol, risk_reason)
+                return {"status": "filtered", "reason": risk_reason, "symbol": symbol}
+
+        # ══════════════════════════════════════════════════════════════════════
+        # STEP 2: Trading Session (weekday + active session)
+        # ══════════════════════════════════════════════════════════════════════
         if not force_session:
             in_session, session_name = session_filter.passes(symbol)
             if not in_session:
                 logger.debug("[scan_pair] %s filtered: outside trading session", symbol)
-                return {
-                    "status": "filtered",
-                    "reason": "outside_session",
-                    "symbol": symbol,
-                }
+                return {"status": "filtered", "reason": "outside_session", "symbol": symbol}
             logger.debug("[scan_pair] %s in session: %s", symbol, session_name)
 
-        # ── FAST-FAIL FILTER 2: Spread ────────────────────────────────────────
-        if not force_filters:
-            current_price = twelve_data.get_realtime_price(symbol)
-            if current_price is None:
-                logger.warning("[scan_pair] %s: could not fetch price for spread check", symbol)
-                return {"status": "error", "reason": "price_fetch_failed", "symbol": symbol}
-
-            spread_ok, spread_msg = spread_filter.passes(symbol)
-            if not spread_ok:
-                logger.info("[scan_pair] %s filtered: %s", symbol, spread_msg)
-                return {"status": "filtered", "reason": "spread", "symbol": symbol, "detail": spread_msg}
-        else:
-            current_price = twelve_data.get_realtime_price(symbol)
-
-        # ── FAST-FAIL FILTER 3: Economic News ────────────────────────────────
+        # ══════════════════════════════════════════════════════════════════════
+        # STEP 3: News Filter (local DB first, fallback to live API)
+        # ══════════════════════════════════════════════════════════════════════
         if not force_filters:
             news_ok, news_msg = news_filter.passes(symbol)
             if not news_ok:
                 logger.info("[scan_pair] %s filtered: %s", symbol, news_msg)
                 return {"status": "filtered", "reason": "news", "symbol": symbol, "detail": news_msg}
 
-        # ── DATA FETCH: All timeframes in one pass ────────────────────────────
+        # ══════════════════════════════════════════════════════════════════════
+        # STEP 4: Fetch price (for spread check) + all OHLCV timeframes
+        # ══════════════════════════════════════════════════════════════════════
+        current_price = twelve_data.get_realtime_price(symbol)
+        if current_price is None:
+            logger.warning("[scan_pair] %s: could not fetch price", symbol)
+            return {"status": "error", "reason": "price_fetch_failed", "symbol": symbol}
+
         logger.info("[scan_pair] %s fetching OHLCV data…", symbol)
         ohlcv_data: Dict = {}
         for tf in _TIMEFRAMES:
-            df = twelve_data.get_candles(symbol, tf, count=200)
+            count = 100 if tf == "M15" else 200
+            df = twelve_data.get_candles(symbol, tf, count=count)
             if df is not None and not df.empty:
                 ohlcv_data[tf] = df
             else:
                 logger.warning("[scan_pair] %s: empty/missing %s candles", symbol, tf)
 
-        if not ohlcv_data:
-            logger.error("[scan_pair] %s: no OHLCV data fetched", symbol)
+        if not ohlcv_data or "H1" not in ohlcv_data:
+            logger.error("[scan_pair] %s: missing critical OHLCV data", symbol)
             return {"status": "error", "reason": "no_ohlcv_data", "symbol": symbol}
 
-        # ── FAST-FAIL FILTER 4: Volatility (requires ATR from H1) ────────────
+        # ══════════════════════════════════════════════════════════════════════
+        # STEP 5: Spread Filter
+        # ══════════════════════════════════════════════════════════════════════
         if not force_filters:
-            h1_df = ohlcv_data.get("H1")
-            if h1_df is not None:
-                vol_ok, vol_msg = volatility_filter.passes(symbol, h1_df)
-                if not vol_ok:
-                    logger.info("[scan_pair] %s filtered: %s", symbol, vol_msg)
-                    return {
-                        "status": "filtered",
-                        "reason": "volatility",
-                        "symbol": symbol,
-                        "detail": vol_msg,
-                    }
+            spread_ok, spread_msg = spread_filter.passes(symbol)
+            if not spread_ok:
+                logger.info("[scan_pair] %s filtered: %s", symbol, spread_msg)
+                return {"status": "filtered", "reason": "spread", "symbol": symbol, "detail": spread_msg}
 
-        # ── STRATEGIES: Run all 4 ─────────────────────────────────────────────
+        # ══════════════════════════════════════════════════════════════════════
+        # STEP 6: Market Regime Detection
+        # ══════════════════════════════════════════════════════════════════════
+        if not force_filters:
+            h4_df = ohlcv_data.get("H4")
+            if h4_df is not None:
+                regime = market_regime_detector.detect(ohlcv_data["H1"], h4_df, symbol)
+            else:
+                # H4 missing — use H1 twice (graceful degradation)
+                regime = market_regime_detector.detect(ohlcv_data["H1"], ohlcv_data["H1"], symbol)
+
+            if not regime["allow_signal"]:
+                logger.info(
+                    "[scan_pair] %s REGIME BLOCKED: %s (%s)",
+                    symbol, regime["regime"], regime["reason"],
+                )
+                return {
+                    "status": "filtered",
+                    "reason": f"regime_{regime['regime'].lower()}",
+                    "symbol": symbol,
+                    "detail": regime["reason"],
+                }
+        else:
+            regime = {"regime": "TRENDING", "allow_signal": True, "adx": 0, "confidence": 1.0, "reason": "forced"}
+
+        # ══════════════════════════════════════════════════════════════════════
+        # STEP 7: Consolidation Filter
+        # ══════════════════════════════════════════════════════════════════════
+        if not force_filters:
+            is_cons, cons_reason = consolidation_filter.is_consolidating(ohlcv_data["H1"], symbol)
+            if is_cons:
+                logger.info("[scan_pair] %s CONSOLIDATION BLOCKED: %s", symbol, cons_reason)
+                return {
+                    "status": "filtered",
+                    "reason": "consolidation",
+                    "symbol": symbol,
+                    "detail": cons_reason,
+                }
+
+        # ══════════════════════════════════════════════════════════════════════
+        # STEP 8: Volatility Filter (requires ATR from H1)
+        # ══════════════════════════════════════════════════════════════════════
+        if not force_filters:
+            vol_ok, vol_msg = volatility_filter.passes(symbol, ohlcv_data["H1"])
+            if not vol_ok:
+                logger.info("[scan_pair] %s filtered: %s", symbol, vol_msg)
+                return {
+                    "status": "filtered",
+                    "reason": "volatility",
+                    "symbol": symbol,
+                    "detail": vol_msg,
+                }
+
+        # ══════════════════════════════════════════════════════════════════════
+        # STEP 9: Run Four Core Strategies
+        # ══════════════════════════════════════════════════════════════════════
         logger.info("[scan_pair] %s running strategies…", symbol)
         strategy_results = []
-
         for strategy in (_mtf_strategy, _smc_strategy, _pa_strategy, _tech_strategy):
             try:
                 result = strategy.analyze(symbol, ohlcv_data)
@@ -157,16 +227,15 @@ def scan_pair(
                     symbol, strategy.name, result.direction, result.score,
                 )
             except Exception as exc:
-                logger.exception(
-                    "[scan_pair] %s strategy %s error: %s",
-                    symbol, strategy.name, exc,
-                )
+                logger.exception("[scan_pair] %s strategy %s error: %s", symbol, strategy.name, exc)
 
         if not strategy_results:
             logger.error("[scan_pair] %s: all strategies failed", symbol)
             return {"status": "error", "reason": "all_strategies_failed", "symbol": symbol}
 
-        # ── CONSENSUS ENGINE ──────────────────────────────────────────────────
+        # ══════════════════════════════════════════════════════════════════════
+        # STEP 10: Consensus Engine
+        # ══════════════════════════════════════════════════════════════════════
         logger.info("[scan_pair] %s computing consensus…", symbol)
         consensus = _consensus.compute(
             results=strategy_results,
@@ -174,34 +243,118 @@ def scan_pair(
             entry_price=current_price,
         )
 
-        # DEBUG: Always log strategy scores (even when no signal)
-        strategy_scores_str = " | ".join(
-            f"{r.strategy_name[:3]}:{r.direction[:1]}{r.score}"
-            for r in strategy_results
+        scores_str = " | ".join(
+            f"{r.strategy_name[:3]}:{r.direction[:1]}{r.score}" for r in strategy_results
         )
         logger.info(
-            "[%s] Scores → %s | Consensus=%d %s | Agreement=%d/%d",
-            symbol, strategy_scores_str, consensus.consensus_score,
-            consensus.direction, consensus.agreement_count, len(strategy_results)
+            "[%s] Scores → %s | Consensus=%d %s | Agreement=%d/%d | Regime=%s",
+            symbol, scores_str, consensus.consensus_score,
+            consensus.direction, consensus.agreement_count,
+            len(strategy_results), regime["regime"],
         )
 
         if not consensus.is_valid:
-            logger.info(
-                "[scan_pair] %s consensus invalid: %s", symbol, consensus.reasoning
-            )
+            logger.info("[scan_pair] %s consensus invalid: %s", symbol, consensus.reasoning)
             return {
-                "status": "no_signal",
-                "symbol": symbol,
-                "reason": consensus.reasoning,
+                "status":          "no_signal",
+                "symbol":          symbol,
+                "reason":          consensus.reasoning,
                 "consensus_score": consensus.consensus_score,
-                "agreement": f"{consensus.agreement_count}/{consensus.total_strategies}",
+                "agreement":       f"{consensus.agreement_count}/{consensus.total_strategies}",
             }
 
-        # ── SIGNAL GENERATION (builds Signal object from consensus) ───────────
+        # ══════════════════════════════════════════════════════════════════════
+        # STEP 11: Session Strength — dynamic effective minimum score
+        # ══════════════════════════════════════════════════════════════════════
+        utc_hour = datetime.now(timezone.utc).hour
+        session  = session_strength_analyzer.analyze(symbol, utc_hour)
+
+        base_min = getattr(settings, "MIN_CONSENSUS_SCORE", 65)
+
+        if not session["allow"]:
+            # Weak session — demand higher quality
+            effective_min = base_min + 10
+        elif session["boost"]:
+            # Prime session — slightly relax threshold
+            effective_min = max(base_min - 5, 55)
+        else:
+            effective_min = base_min
+
+        # Regime trend boost
+        if regime["regime"] == "TRENDING":
+            effective_min = max(effective_min - 5, 55)
+
+        adjusted_score = consensus.consensus_score
+        if consensus.consensus_score < effective_min:
+            logger.info(
+                "[scan_pair] %s score %d < effective_min %d (session=%s) – no signal",
+                symbol, consensus.consensus_score, effective_min, session["sessions"],
+            )
+            return {
+                "status":     "no_signal",
+                "symbol":     symbol,
+                "reason":     f"score_{consensus.consensus_score}_below_{effective_min}",
+                "session":    session["sessions"],
+            }
+
+        # ══════════════════════════════════════════════════════════════════════
+        # STEP 12: Chart Pattern Detection
+        # ══════════════════════════════════════════════════════════════════════
+        patterns = {"patterns": [], "score": 0, "confirmed": False, "blocked": False}
+        h4_df = ohlcv_data.get("H4")
+        if h4_df is not None:
+            patterns = chart_pattern_detector.detect(h4_df, ohlcv_data["H1"], consensus.direction)
+            if patterns["blocked"]:
+                pattern_names = [p.get("name", "?") for p in patterns["patterns"]]
+                logger.info(
+                    "[scan_pair] %s PATTERN BLOCKED: %s (score=%d)",
+                    symbol, pattern_names, patterns["score"],
+                )
+                return {
+                    "status": "no_signal",
+                    "symbol": symbol,
+                    "reason": f"pattern_conflict: {pattern_names}",
+                }
+
+        # ══════════════════════════════════════════════════════════════════════
+        # STEP 13: M15 Entry Confirmation
+        # ══════════════════════════════════════════════════════════════════════
+        m15_result = {"confirmed": False, "score": 0, "reasons": [], "rsi_m15": 50.0, "vol_ratio": 1.0}
+        m15_df = ohlcv_data.get("M15")
+        if m15_df is not None and len(m15_df) >= 30:
+            m15_result = m15_confirmation.confirm(m15_df, consensus.direction, symbol)
+            if not m15_result["confirmed"]:
+                logger.info(
+                    "[scan_pair] %s M15 entry not confirmed (score=%d/50) – deferring",
+                    symbol, m15_result["score"],
+                )
+                # Not a hard block — signal saved as WAIT_M15
+                # For now, we proceed but mark the signal accordingly
+
+        # ══════════════════════════════════════════════════════════════════════
+        # STEP 14: Correlation Filter
+        # ══════════════════════════════════════════════════════════════════════
+        if not force_filters:
+            corr_blocked, corr_reason = correlation_filter.should_block(symbol, consensus.direction)
+            if corr_blocked:
+                logger.info("[scan_pair] %s CORRELATION BLOCKED: %s", symbol, corr_reason)
+                return {"status": "filtered", "reason": corr_reason, "symbol": symbol}
+
+        # ══════════════════════════════════════════════════════════════════════
+        # STEP 15: Build Signal object
+        # ══════════════════════════════════════════════════════════════════════
         logger.info(
-            "[scan_pair] %s valid consensus: %s score=%d confidence=%s",
-            symbol, consensus.direction, consensus.consensus_score, consensus.confidence_label,
+            "[scan_pair] %s valid consensus: %s score=%d conf=%s session=%s regime=%s",
+            symbol, consensus.direction, consensus.consensus_score,
+            consensus.confidence_label, session["sessions"], regime["regime"],
         )
+
+        # Boost score for confirmed chart patterns and M15 alignment
+        boosted_score = consensus.consensus_score
+        if patterns["confirmed"]:
+            boosted_score = min(boosted_score + 5, 100)
+        if m15_result["confirmed"]:
+            boosted_score = min(boosted_score + 8, 100)
 
         signal = Signal(
             pair=symbol,
@@ -213,29 +366,36 @@ def scan_pair(
             take_profit_3=None,
             timeframe="H1",
             strategy_scores={r.strategy_name: r.score for r in strategy_results},
-            consensus_score=consensus.consensus_score,
+            consensus_score=boosted_score,
             confidence=consensus.confidence_label,
             filters_passed={
-                "session": not force_session,
-                "spread": not force_filters,
-                "news": not force_filters,
-                "volatility": not force_filters,
+                "session":      not force_session,
+                "spread":       not force_filters,
+                "news":         not force_filters,
+                "volatility":   not force_filters,
+                "regime":       regime["regime"],
+                "m15_confirmed": m15_result["confirmed"],
+                "m15_score":    m15_result["score"],
+                "patterns":     [p.get("name") for p in patterns["patterns"]],
+                "session_boost": session.get("boost", False),
             },
             status="PENDING",
             sent_at=datetime.now(timezone.utc),
         )
 
         if signal.stop_loss is None or signal.take_profit_1 is None:
-            logger.warning("[scan_pair] %s: consensus missing SL/TP levels", symbol)
+            logger.warning("[scan_pair] %s: consensus missing SL/TP", symbol)
             return {"status": "no_signal", "symbol": symbol, "reason": "missing_sl_tp"}
 
-        # ── SIGNAL VALIDATION ─────────────────────────────────────────────────
-        is_valid, reason = signal_validator.validate(signal)
+        # ── Signal Validation ─────────────────────────────────────────────────
+        is_valid, val_reason = signal_validator.validate(signal)
         if not is_valid:
-            logger.warning("[scan_pair] %s signal invalid: %s", symbol, reason)
-            return {"status": "invalid", "symbol": symbol, "reason": reason}
+            logger.warning("[scan_pair] %s signal invalid: %s", symbol, val_reason)
+            return {"status": "invalid", "symbol": symbol, "reason": val_reason}
 
-        # ── DISPATCH (save + Telegram) ────────────────────────────────────────
+        # ══════════════════════════════════════════════════════════════════════
+        # STEP 15: Save + Dispatch (DB + Telegram)
+        # ══════════════════════════════════════════════════════════════════════
         signal_id = notification_manager.dispatch_signal(signal)
         if not signal_id:
             logger.error("[scan_pair] %s dispatch failed", symbol)
@@ -248,6 +408,7 @@ def scan_pair(
             logger.warning("[scan_pair] BotStateRepository update failed: %s", exc)
 
         elapsed = (datetime.now(timezone.utc) - start_ts).total_seconds()
+
         result = {
             "status":          "success",
             "symbol":          symbol,
@@ -255,9 +416,20 @@ def scan_pair(
             "direction":       signal.direction,
             "consensus_score": signal.consensus_score,
             "confidence":      signal.confidence,
+            "regime":          regime["regime"],
+            "session":         session["sessions"],
+            "patterns":        [p.get("name") for p in patterns["patterns"]],
+            "m15_confirmed":   m15_result["confirmed"],
+            "m15_score":       m15_result["score"],
             "elapsed_s":       round(elapsed, 2),
         }
-        logger.info("[scan_pair] SUCCESS %s → %s", symbol, result)
+
+        logger.info(
+            "[scan_pair] ✅ SIGNAL SENT: %s %s score=%d m15=%s session=%s regime=%s (%.1fs)",
+            symbol, signal.direction, signal.consensus_score,
+            m15_result["confirmed"], session["sessions"],
+            regime["regime"], elapsed,
+        )
         return result
 
     except Exception as exc:
@@ -274,6 +446,10 @@ def scan_pair(
             return {"status": "failed", "symbol": symbol, "error": str(exc)}
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Scan All Pairs dispatcher (unchanged API)
+# ══════════════════════════════════════════════════════════════════════════════
+
 @celery_app.task(
     name="tasks.scan_all_pairs",
     queue="default",
@@ -284,26 +460,23 @@ def scan_all_pairs(
 ) -> Dict:
     """
     Dispatch individual scan_pair tasks for all configured trading pairs.
-
-    Returns a summary dict with task IDs for monitoring.
+    Returns summary dict with task IDs for monitoring.
     """
     pairs = getattr(settings, "TRADING_PAIRS", [])
     logger.info("[scan_all_pairs] Dispatching %d pairs: %s", len(pairs), pairs)
 
     task_ids = []
     for i, pair in enumerate(pairs):
-        # Stagger tasks by 15s to respect Twelve Data API limit (8 calls/min)
-        countdown = i * 15
+        countdown = i * 15  # stagger 15s apart to respect API rate limits
         task = scan_pair.apply_async(
             args=[pair],
-            kwargs={
-                "force_session": force_session,
-                "force_filters": force_filters,
-            },
+            kwargs={"force_session": force_session, "force_filters": force_filters},
             queue="signals",
             countdown=countdown,
         )
         task_ids.append({"pair": pair, "task_id": task.id})
-        logger.debug("[scan_all_pairs] Dispatched %s → task %s (start in %ds)", pair, task.id, countdown)
+        logger.debug(
+            "[scan_all_pairs] Dispatched %s → task %s (start in %ds)", pair, task.id, countdown
+        )
 
     return {"dispatched": len(task_ids), "tasks": task_ids}

@@ -1,73 +1,103 @@
-<div class="space-y-4">
+{{-- ERICKsky Dashboard — performance-stats Livewire component (v2 Institutional) --}}
 
-    {{-- Period Tabs --}}
-    <div class="tabs tabs-boxed bg-base-200 w-fit">
-        <button wire:click="setPeriod('today')"
-                class="tab {{ $period === 'today' ? 'tab-active' : '' }}">Today</button>
-        <button wire:click="setPeriod('week')"
-                class="tab {{ $period === 'week' ? 'tab-active' : '' }}">This Week</button>
-        <button wire:click="setPeriod('month')"
-                class="tab {{ $period === 'month' ? 'tab-active' : '' }}">This Month</button>
-        <button wire:click="setPeriod('all')"
-                class="tab {{ $period === 'all' ? 'tab-active' : '' }}">All Time</button>
+<div>
+    {{-- Period selector --}}
+    <div class="flex flex-wrap gap-2 mb-5">
+        @foreach(['today' => 'Today', 'week' => 'This Week', 'month' => 'This Month', 'all' => 'All Time'] as $val => $label)
+        <button wire:click="setPeriod('{{ $val }}')"
+            class="btn btn-sm {{ $period === $val ? 'btn-primary' : 'btn-ghost' }}">
+            {{ $label }}
+        </button>
+        @endforeach
     </div>
 
-    {{-- Stats Row --}}
-    <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+    {{-- Row 1: Core KPIs --}}
+    <div class="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-4 mb-4">
 
+        {{-- Total Signals --}}
         <div class="stat bg-base-200 rounded-xl p-4 shadow">
-            <div class="stat-title text-xs">Signals</div>
-            <div class="stat-value text-2xl text-primary">{{ $stats['total'] }}</div>
+            <div class="stat-title text-xs opacity-60">Signals</div>
+            <div class="stat-value text-2xl font-bold">{{ $stats['total'] }}</div>
+            <div class="stat-desc">{{ $stats['pending'] }} pending</div>
         </div>
 
+        {{-- Win Rate --}}
         <div class="stat bg-base-200 rounded-xl p-4 shadow">
-            <div class="stat-title text-xs">Wins</div>
-            <div class="stat-value text-2xl text-success">{{ $stats['wins'] }}</div>
-        </div>
-
-        <div class="stat bg-base-200 rounded-xl p-4 shadow">
-            <div class="stat-title text-xs">Losses</div>
-            <div class="stat-value text-2xl text-error">{{ $stats['losses'] }}</div>
-        </div>
-
-        <div class="stat bg-base-200 rounded-xl p-4 shadow">
-            <div class="stat-title text-xs">Win Rate</div>
-            <div class="stat-value text-2xl {{ $stats['win_rate'] >= 60 ? 'text-success' : ($stats['win_rate'] >= 50 ? 'text-warning' : 'text-error') }}">
+            <div class="stat-title text-xs opacity-60">Win Rate</div>
+            <div class="stat-value text-2xl font-bold {{ $stats['win_rate'] >= 60 ? 'text-success' : ($stats['win_rate'] >= 45 ? 'text-warning' : 'text-error') }}">
                 {{ $stats['win_rate'] }}%
             </div>
+            <div class="stat-desc">{{ $stats['wins'] }}W / {{ $stats['losses'] }}L</div>
         </div>
 
+        {{-- Total Pips --}}
         <div class="stat bg-base-200 rounded-xl p-4 shadow">
-            <div class="stat-title text-xs">Total Pips</div>
-            <div class="stat-value text-2xl {{ $stats['total_pips'] >= 0 ? 'text-success' : 'text-error' }}">
+            <div class="stat-title text-xs opacity-60">Total Pips</div>
+            <div class="stat-value text-2xl font-bold {{ $stats['total_pips'] >= 0 ? 'text-success' : 'text-error' }}">
                 {{ $stats['total_pips'] >= 0 ? '+' : '' }}{{ $stats['total_pips'] }}
+            </div>
+            <div class="stat-desc">Closed trades</div>
+        </div>
+
+        {{-- Avg Score --}}
+        <div class="stat bg-base-200 rounded-xl p-4 shadow">
+            <div class="stat-title text-xs opacity-60">Avg Score</div>
+            <div class="stat-value text-2xl font-bold text-info">{{ $stats['avg_score'] }}</div>
+            <div class="stat-desc">Consensus /100</div>
+        </div>
+
+        {{-- Subscribers --}}
+        <div class="stat bg-base-200 rounded-xl p-4 shadow">
+            <div class="stat-title text-xs opacity-60">Subscribers</div>
+            <div class="stat-value text-2xl font-bold text-secondary">{{ $stats['subscribers'] }}</div>
+            <div class="stat-desc">Active members</div>
+        </div>
+
+        {{-- M15 Win Rate --}}
+        <div class="stat bg-base-200 rounded-xl p-4 shadow border border-success/20">
+            <div class="stat-title text-xs opacity-60">M15 Win Rate</div>
+            <div class="stat-value text-2xl font-bold text-success">{{ $stats['m15_win_rate'] }}%</div>
+            <div class="stat-desc">M15-confirmed only</div>
+        </div>
+    </div>
+
+    {{-- Row 2: Institutional Upgrade Stats --}}
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+
+        {{-- M15 Confirmed --}}
+        <div class="flex items-center gap-3 bg-success/10 border border-success/20 rounded-xl p-3">
+            <span class="text-2xl">📊</span>
+            <div>
+                <div class="text-lg font-bold">{{ $stats['m15_confirmed'] }}</div>
+                <div class="text-xs opacity-60">M15 Confirmed</div>
             </div>
         </div>
 
-        <div class="stat bg-base-200 rounded-xl p-4 shadow">
-            <div class="stat-title text-xs">Subscribers</div>
-            <div class="stat-value text-2xl text-accent">{{ $stats['subscribers'] }}</div>
+        {{-- Pattern Confirmed --}}
+        <div class="flex items-center gap-3 bg-info/10 border border-info/20 rounded-xl p-3">
+            <span class="text-2xl">📐</span>
+            <div>
+                <div class="text-lg font-bold">{{ $stats['with_pattern'] }}</div>
+                <div class="text-xs opacity-60">Pattern Detected</div>
+            </div>
         </div>
 
+        {{-- High Confidence --}}
+        <div class="flex items-center gap-3 bg-warning/10 border border-warning/20 rounded-xl p-3">
+            <span class="text-2xl">💎</span>
+            <div>
+                <div class="text-lg font-bold">{{ $stats['high_confidence'] }}</div>
+                <div class="text-xs opacity-60">HIGH+ Confidence</div>
+            </div>
+        </div>
+
+        {{-- Pending --}}
+        <div class="flex items-center gap-3 bg-base-300 rounded-xl p-3">
+            <span class="text-2xl">⏳</span>
+            <div>
+                <div class="text-lg font-bold">{{ $stats['pending'] }}</div>
+                <div class="text-xs opacity-60">Pending Signals</div>
+            </div>
+        </div>
     </div>
-
-    {{-- Win Rate Progress Bar --}}
-    @if($stats['wins'] + $stats['losses'] > 0)
-    <div class="bg-base-200 rounded-xl p-4">
-        <div class="flex justify-between text-xs text-base-content/60 mb-2">
-            <span>Win Rate Progress</span>
-            <span>{{ $stats['wins'] }}W / {{ $stats['losses'] }}L</span>
-        </div>
-        <div class="flex rounded-full overflow-hidden h-4">
-            @php $wr = $stats['win_rate']; @endphp
-            <div class="bg-success transition-all duration-500" style="width: {{ $wr }}%"></div>
-            <div class="bg-error transition-all duration-500" style="width: {{ 100 - $wr }}%"></div>
-        </div>
-        <div class="flex justify-between text-xs mt-1">
-            <span class="text-success">{{ $wr }}% Win</span>
-            <span class="text-error">{{ round(100 - $wr, 1) }}% Loss</span>
-        </div>
-    </div>
-    @endif
-
 </div>

@@ -12,25 +12,18 @@ class SignalController extends Controller
     {
         $query = Signal::orderBy('created_at', 'desc');
 
-        if ($request->filled('pair')) {
-            $query->where('pair', $request->pair);
-        }
-        if ($request->filled('direction')) {
-            $query->where('direction', $request->direction);
-        }
-        if ($request->filled('status')) {
-            $query->where('status', $request->status);
-        }
-        if ($request->filled('date_from')) {
-            $query->whereDate('created_at', '>=', $request->date_from);
-        }
-        if ($request->filled('date_to')) {
-            $query->whereDate('created_at', '<=', $request->date_to);
-        }
+        if ($request->filled('pair'))       $query->where('pair',      $request->pair);
+        if ($request->filled('direction'))  $query->where('direction', $request->direction);
+        if ($request->filled('status'))     $query->where('status',    $request->status);
+        if ($request->filled('regime'))     $query->where('market_regime', $request->regime);
+        if ($request->filled('confidence')) $query->where('confidence', $request->confidence);
+        if ($request->filled('m15'))        $query->m15Confirmed();
+        if ($request->filled('pattern'))    $query->withPattern();
+        if ($request->filled('date_from'))  $query->whereDate('created_at', '>=', $request->date_from);
+        if ($request->filled('date_to'))    $query->whereDate('created_at', '<=', $request->date_to);
 
         $signals = $query->paginate(25)->withQueryString();
-
-        $pairs = Signal::select('pair')->distinct()->pluck('pair');
+        $pairs   = Signal::select('pair')->distinct()->pluck('pair');
 
         return view('pages.signals', compact('signals', 'pairs'));
     }
