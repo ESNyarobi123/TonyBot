@@ -7,7 +7,7 @@ blocks trend signals to avoid false breakouts.
 """
 
 import logging
-from typing import Tuple
+from typing import Dict, Tuple
 
 import numpy as np
 import pandas as pd
@@ -19,6 +19,12 @@ class ConsolidationFilter:
     """Detect tight consolidation zones to avoid false-breakout signals."""
 
     LOOKBACK = 20  # candles to examine
+
+    # Per-symbol ratio thresholds (below this = consolidating)
+    _RATIO_THRESHOLD: Dict[str, float] = {
+        "XAUUSD": 0.92,  # Relaxed for Gold — wider ranges are normal
+    }
+    _DEFAULT_RATIO_THRESHOLD: float = 1.1
 
     def is_consolidating(self, df_h1: pd.DataFrame, symbol: str) -> Tuple[bool, str]:
         """
@@ -62,7 +68,8 @@ class ConsolidationFilter:
         bb_width = (bb_std * 4) / (bb_mean + 1e-10)
 
         # ── Decision logic ────────────────────────────────────────────────────
-        is_tight_range = ratio < 1.1
+        ratio_threshold = self._RATIO_THRESHOLD.get(symbol.upper(), self._DEFAULT_RATIO_THRESHOLD)
+        is_tight_range = ratio < ratio_threshold
         is_bb_squeeze  = bb_width < 0.004
 
         current     = float(close[-1])

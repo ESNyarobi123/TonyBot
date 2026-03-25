@@ -2,10 +2,11 @@
 ERICKsky Signal Engine - Market Regime Detector (Upgrade 1)
 
 Classifies the current market condition into one of:
-  TRENDING   → Allow trend signals
-  WEAK_TREND → Allow trend signals (lower confidence)
-  RANGING    → Block trend signals
-  VOLATILE   → Block ALL signals (ATR spike detected)
+  TRENDING          → Allow trend signals
+  WEAK_TREND        → Allow trend signals (lower confidence)
+  VOLATILE_BREAKOUT → Allow signals (BB squeeze + ADX rising = breakout imminent)
+  RANGING           → Block trend signals
+  VOLATILE          → Block ALL signals (ATR spike detected)
 
 Uses 4 methods:
   1. ADX (trend strength)
@@ -44,8 +45,10 @@ class MarketRegimeDetector:
         high_h1  = df_h1["high"].values
         low_h1   = df_h1["low"].values
 
-        # ── METHOD 1: ADX (Trend Strength) ──────────────────────────────────
+        # ── METHOD 1: ADX (Trend Strength) ────────────────────────
         adx = self._calculate_adx(df_h1, period=14)
+        adx_prev = self._calculate_adx(df_h1.iloc[:-5], period=14) if len(df_h1) > 20 else adx
+        adx_rising = adx > adx_prev
 
         # ── METHOD 2: Bollinger Band Width ───────────────────────────────────
         bb_width = self._calculate_bb_width(close_h1, period=20, std=2.0)
@@ -98,7 +101,7 @@ class MarketRegimeDetector:
         recent_atr     = self._calculate_atr(tail_df, min(5, len(tail_df)))
         volatility_score = 100 if recent_atr > atr * 2.0 else 0
 
-        # ── REGIME DECISION ──────────────────────────────────────────────────
+        # ── REGIME DECISION ──────────────────────────────────
         if volatility_score >= 100:
             regime     = "VOLATILE"
             confidence = 0.0
@@ -108,6 +111,12 @@ class MarketRegimeDetector:
             regime     = "TRENDING"
             confidence = min(trend_score / 100, 1.0)
             reason     = f"ADX={adx:.1f}, slope={ema_slope:.3f}"
+
+        elif bb_squeeze and adx > 20 and adx_rising:
+            # 4K Vision: ADX rising above 20 during BB squeeze = breakout imminent
+            regime     = "VOLATILE_BREAKOUT"
+            confidence = 0.6
+            reason     = f"BB squeeze + ADX rising ({adx:.1f}> 20, prev={adx_prev:.1f}) → breakout imminent"
 
         elif trend_score <= 0 or bb_squeeze:
             regime     = "RANGING"
@@ -134,7 +143,7 @@ class MarketRegimeDetector:
             "range_ratio":  range_ratio,
             "ema_slope":    ema_slope,
             "reason":       reason,
-            "allow_signal": regime in ("TRENDING", "WEAK_TREND"),
+            "allow_signal": regime in ("TRENDING", "WEAK_TREND", "VOLATILE_BREAKOUT"),
         }
 
     # ── Private helpers ───────────────────────────────────────────────────────
