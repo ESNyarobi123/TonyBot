@@ -22,7 +22,7 @@ class ConsolidationFilter:
 
     # Per-symbol ratio thresholds (below this = consolidating)
     _RATIO_THRESHOLD: Dict[str, float] = {
-        "XAUUSD": 0.92,  # Relaxed for Gold — wider ranges are normal
+        "XAUUSD": 0.70,  # Relaxed for Gold — ratio > 0.70 passes through
     }
     _DEFAULT_RATIO_THRESHOLD: float = 1.1
 
