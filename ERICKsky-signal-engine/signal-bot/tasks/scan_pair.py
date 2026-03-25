@@ -307,6 +307,23 @@ def scan_pair(
 
         adjusted_score = consensus.consensus_score
         if consensus.consensus_score < effective_min:
+            # ── Early Warning System: scores 70-79 → admin-only alert ────────
+            if 70 <= consensus.consensus_score < 80 and consensus.agreement_count >= 3:
+                early_warning_msg = (
+                    f"⚠️ *EARLY WARNING (Score: {consensus.consensus_score})*\n"
+                    f"Pair: {symbol}\n"
+                    f"Direction: {consensus.direction}\n"
+                    f"Reason: Near-Premium setup detected. Manual review advised."
+                )
+                try:
+                    notification_manager.send_admin_alert(early_warning_msg)
+                    logger.info(
+                        "[scan_pair] %s EARLY WARNING sent to admin (score=%d)",
+                        symbol, consensus.consensus_score,
+                    )
+                except Exception as exc:
+                    logger.warning("[scan_pair] %s early warning send failed: %s", symbol, exc)
+
             logger.info(
                 "[scan_pair] %s score %d < effective_min %d (session=%s) – no signal",
                 symbol, consensus.consensus_score, effective_min, session["sessions"],
