@@ -18,10 +18,12 @@ from strategies.smart_money import SmartMoneyStrategy
 from strategies.price_action import PriceActionStrategy
 from strategies.technical import TechnicalStrategy
 from strategies.consensus_engine import ConsensusEngine, ConsensusResult
+from strategies.market_context import MarketContextBuilder
 from filters.news_filter import NewsFilter
 from filters.session_filter import SessionFilter
 from filters.spread_filter import SpreadFilter
 from filters.volatility_filter import VolatilityFilter
+from config.settings import BREAKEVEN_TRIGGER_PCT, BREAKEVEN_BUFFER_PIPS, PIP_VALUES as _PIP_VALUES
 
 logger = logging.getLogger(__name__)
 
@@ -115,11 +117,22 @@ class SignalGenerator:
             logger.info("Signal blocked for %s. Failed filters: %s", symbol, blocking)
             return None
 
-        # ── 6. Run all 4 strategies ───────────────────────────────────────────
+        # ── 6. Build SharedMarketContext (ONCE for all strategies) ────────────
+        ctx = None
+        try:
+            ctx = MarketContextBuilder().build(symbol, data)
+            logger.info(
+                f"SharedMarketContext built for {symbol}: "
+                f"SMC_setup={ctx.complete_smc_setup}({ctx.smc_setup_direction}:{ctx.smc_setup_score:.0f})"
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to build MarketContext for {symbol}: {exc}")
+        
+        # ── 7. Run all 4 strategies (WITH shared context) ─────────────────────
         results = []
         for strategy in self.strategies:
             try:
-                result = strategy.analyze(symbol, data)
+                result = strategy.analyze(symbol, data, ctx)
                 if result.is_valid():
                     results.append(result)
                     logger.debug(
@@ -214,6 +227,17 @@ class SignalGenerator:
             elif r.strategy_name == "TechnicalIndicators":
                 tech_dir = r.direction
         
+        # ── 10b. Calculate breakeven trigger (ACTIVE MANAGEMENT) ──────────
+        be_trigger_pct = BREAKEVEN_TRIGGER_PCT  # 0.50
+        pip_size = _PIP_VALUES.get(symbol.upper(), 0.0001)
+        tp1_dist = abs(tp1 - entry)
+        if consensus.direction == "BUY":
+            be_trigger_price = round(entry + tp1_dist * be_trigger_pct, 5)
+            be_sl_price = round(entry + BREAKEVEN_BUFFER_PIPS * pip_size, 5)
+        else:
+            be_trigger_price = round(entry - tp1_dist * be_trigger_pct, 5)
+            be_sl_price = round(entry - BREAKEVEN_BUFFER_PIPS * pip_size, 5)
+
         signal = Signal(
             pair=symbol,
             direction=consensus.direction,

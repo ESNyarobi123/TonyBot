@@ -59,12 +59,34 @@ _pairs_raw: str = os.getenv("TRADING_PAIRS", "EURUSD,GBPUSD,USDJPY,XAUUSD")
 TRADING_PAIRS: List[str] = [p.strip() for p in _pairs_raw.split(",") if p.strip()]
 
 SCAN_INTERVAL_MINUTES: int = int(os.getenv("SCAN_INTERVAL_MINUTES", "60"))
-MIN_CONSENSUS_SCORE: int = int(os.getenv("MIN_CONSENSUS_SCORE", "65"))
+MIN_CONSENSUS_SCORE: int = int(os.getenv("MIN_CONSENSUS_SCORE", "80"))
 SIGNAL_VALID_MINUTES: int = int(os.getenv("SIGNAL_VALID_MINUTES", "240"))
 MAX_SIGNALS_PER_PAIR_PER_DAY: int = int(
     os.getenv("MAX_SIGNALS_PER_PAIR_PER_DAY", "3")
 )
 RISK_REWARD_RATIO: float = float(os.getenv("RISK_REWARD_RATIO", "2.0"))
+
+# ─── DXY Correlation Filter ──────────────────────────────────────────────────
+
+# USD pairs affected by DXY (Dollar Index) correlation
+DXY_USD_PAIRS: List[str] = ["EURUSD", "GBPUSD", "AUDUSD", "NZDUSD"]
+DXY_SYMBOL: str = "DXY"  # Dollar Index symbol for data fetcher
+DXY_EMA_PERIOD: int = 21  # EMA period for DXY trend detection
+DXY_PROXY_MODE: bool = True  # Use EURUSD/GBPUSD inverse proxy when DXY unavailable
+DXY_PROXY_PAIRS: List[str] = ["EURUSD", "GBPUSD"]  # Pairs for dual-proxy DXY derivation
+
+# ─── Strict Trading Window (UTC) ─────────────────────────────────────────────
+
+STRICT_TRADING_START_UTC: int = 6   # 06:00 UTC (09:00 EAT)
+STRICT_TRADING_END_UTC: int = 18    # 18:00 UTC (21:00 EAT)
+ASIAN_SESSION_START_UTC: int = 21   # 21:00 UTC
+ASIAN_SESSION_END_UTC: int = 6      # 06:00 UTC
+
+# ─── Breakeven / Active Management ───────────────────────────────────────────
+
+BREAKEVEN_TRIGGER_PCT: float = 0.50  # Move to BE when price reaches 50% of TP1
+PARTIAL_CLOSE_PCT: float = 0.50      # Close 50% at TP1
+BREAKEVEN_BUFFER_PIPS: float = 1.0   # SL moved to Entry + 1 pip
 
 # Timeframes used for analysis
 TIMEFRAMES: List[str] = ["1min", "5min", "15min", "1h", "4h", "1day"]
@@ -114,12 +136,16 @@ NEWS_BLACKOUT_MINUTES: int = 30
 
 # Stop loss in pips per pair type
 SL_PIPS_FOREX: float = 20.0
-SL_PIPS_GOLD: float = 150.0
+SL_PIPS_GOLD: float = 50.0  # Aligned with institutional consensus
 
 # Take profit multipliers
 TP1_MULTIPLIER: float = 1.0   # 1:1
 TP2_MULTIPLIER: float = 2.0   # 1:2
 TP3_MULTIPLIER: float = 3.0   # 1:3
+
+# Daily risk limits
+MAX_DAILY_LOSS_PCT: float = float(os.getenv("MAX_DAILY_LOSS_PCT", "3.0"))  # Safety circuit breaker
+RISK_PER_TRADE_PCT: float = float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))  # For lot size auto-calc
 
 # ─── Pip Values ───────────────────────────────────────────────────────────────
 
@@ -143,8 +169,8 @@ CACHE_TTL_OHLCV_1MIN: int = 60
 CACHE_TTL_OHLCV_5MIN: int = 300
 CACHE_TTL_OHLCV_15MIN: int = 900
 CACHE_TTL_OHLCV_1H: int = 3600
-CACHE_TTL_OHLCV_4H: int = 14400
-CACHE_TTL_OHLCV_1D: int = 86400
+CACHE_TTL_OHLCV_4H: int = 14400   # 4 hours — fetch only once per 4h window
+CACHE_TTL_OHLCV_1D: int = 14400   # 4 hours — fetch only once per 4h window
 CACHE_TTL_SIGNAL: int = 1800
 CACHE_TTL_NEWS: int = 600
 

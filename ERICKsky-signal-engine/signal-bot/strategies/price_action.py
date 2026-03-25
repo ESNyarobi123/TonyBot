@@ -26,6 +26,7 @@ import numpy as np
 import pandas as pd
 
 from strategies.base_strategy import BaseStrategy, StrategyResult
+from strategies.market_context import SharedMarketContext
 from config.settings import PIP_VALUES
 
 logger = logging.getLogger(__name__)
@@ -60,47 +61,83 @@ class PriceActionStrategy(BaseStrategy):
         self,
         symbol: str,
         data: Dict[str, Optional[pd.DataFrame]],
+        ctx: SharedMarketContext = None,
     ) -> StrategyResult:
         """Run the full PA analysis pipeline."""
         try:
-            return self._run(symbol, data)
+            return self._run(symbol, data, ctx)
         except Exception as exc:
             logger.exception("PA error for %s: %s", symbol, exc)
             return self._neutral_result(self.name, f"Error: {exc}")
 
     # ── Main pipeline ─────────────────────────────────────────────────────────
 
-    def _run(self, symbol: str, data: dict) -> StrategyResult:
+    def _run(self, symbol: str, data: dict, ctx: SharedMarketContext = None) -> StrategyResult:
         pip_size = PIP_VALUES.get(symbol.upper(), 0.0001)
 
-        df_h4 = self._get_df(data, "H4")   # S/R levels source
-        df_h1 = self._get_df(data, "H1")   # pattern + breakout source
+        df_h4 = self._get_df(data, "H4")
+        df_h1 = self._get_df(data, "H1")
 
         if df_h1 is None:
             return self._neutral_result(self.name, "No H1 data")
 
         price = float(df_h1["close"].iloc[-1])
 
-        # ── COMPONENT 1: Dynamic S/R Levels (H4) ──────────────────────────────
-        sr_df       = df_h4 if df_h4 is not None else df_h1
-        levels      = self._build_sr_levels(sr_df, pip_size)
-        nearest_sup = self._nearest_level(levels, price, "SUPPORT",    pip_size)
-        nearest_res = self._nearest_level(levels, price, "RESISTANCE", pip_size)
-        at_support  = nearest_sup is not None and abs(price - nearest_sup.price) <= _AT_LEVEL_PIPS * pip_size
-        at_resist   = nearest_res is not None and abs(price - nearest_res.price) <= _AT_LEVEL_PIPS * pip_size
-        strong_sup  = at_support  and (nearest_sup.touches  >= _STRONG_LEVEL_TOUCHES or nearest_sup.is_flip)
-        strong_res  = at_resist   and (nearest_res.touches >= _STRONG_LEVEL_TOUCHES or nearest_res.is_flip)
+        # USE CONTEXT KEY LEVELS if provided
+        if ctx:
+            support_levels = ctx.key_support_levels
+            resistance_levels = ctx.key_resistance_levels
+            nearest_sup_price = ctx.nearest_support
+            nearest_res_price = ctx.nearest_resistance
+            current = ctx.current_price
+            atr = ctx.atr_h1
+            
+            # Check if at support/resistance
+            at_support = nearest_sup_price and abs(current - nearest_sup_price) < atr * 0.5
+            at_resist = nearest_res_price and abs(current - nearest_res_price) < atr * 0.5
+            strong_sup = at_support
+            strong_res = at_resist
+            
+            # Create dummy level objects for compatibility
+            class DummyLevel:
+                def __init__(self, price):
+                    self.price = price
+                    self.touches = 3
+                    self.is_flip = False
+                    self.zone_type = "SUPPORT" if price else "RESISTANCE"
+            
+            nearest_sup = DummyLevel(nearest_sup_price) if nearest_sup_price else None
+            nearest_res = DummyLevel(nearest_res_price) if nearest_res_price else None
+            levels = []
+        else:
+            # Fallback to old calculation
+            sr_df = df_h4 if df_h4 is not None else df_h1
+            levels = self._build_sr_levels(sr_df, pip_size)
+            nearest_sup = self._nearest_level(levels, price, "SUPPORT", pip_size)
+            nearest_res = self._nearest_level(levels, price, "RESISTANCE", pip_size)
+            at_support = nearest_sup is not None and abs(price - nearest_sup.price) <= _AT_LEVEL_PIPS * pip_size
+            at_resist = nearest_res is not None and abs(price - nearest_res.price) <= _AT_LEVEL_PIPS * pip_size
+            strong_sup = at_support and (nearest_sup.touches >= _STRONG_LEVEL_TOUCHES or nearest_sup.is_flip)
+            strong_res = at_resist and (nearest_res.touches >= _STRONG_LEVEL_TOUCHES or nearest_res.is_flip)
 
         # ── COMPONENT 2: Candlestick Patterns (H1) ───────────────────────────
         pattern, pattern_dir = self._detect_patterns(df_h1, pip_size)
 
         # ── COMPONENT 2b: Pattern Confluence with Zones ──────────────────────
-        confluence, pa_score = self._check_pattern_at_zone(
-            pattern, price, levels, pip_size
-        )
+        # CRUCIAL: Pattern MUST be at key level or OB!
+        at_ob_zone = ctx.price_at_ob if ctx else False
+        
+        if ctx:
+            confluence, pa_score = self._check_pattern_at_ob(
+                pattern, at_ob_zone, ctx.ob_type_at_price, at_support, at_resist
+            )
+        else:
+            confluence, pa_score = self._check_pattern_at_zone(
+                pattern, price, levels, pip_size
+            )
 
         # ── COMPONENT 3: Breakout + Retest (H1) ──────────────────────────────
-        bo_retest, bo_dir = self._detect_breakout_retest(df_h1, levels, pip_size)
+        bo_retest, bo_dir = self._detect_breakout_retest(df_h1, levels, pip_size) if not ctx else (False, "NONE")
 
         # ── COMPONENT 4: Trendline (H1) ──────────────────────────────────────
         tl_dir = self._trendline_direction(df_h1)
@@ -112,6 +149,30 @@ class PriceActionStrategy(BaseStrategy):
             confluence=confluence, pa_score=pa_score,
             bo_retest=bo_retest, bo_dir=bo_dir,
             tl_dir=tl_dir,
+        )
+        
+        # Context alignment bonus
+        if ctx:
+            if ctx.structure.bias == "BULLISH":
+                buy_score = int(buy_score * 1.1)
+            elif ctx.structure.bias == "BEARISH":
+                sell_score = int(sell_score * 1.1)
+        
+        # OB Confluence Boost: +20% if price action occurs within an Order Block
+        if ctx and ctx.price_at_ob:
+            if ctx.ob_type_at_price == "BULLISH_OB" and buy_score > 0:
+                buy_score = min(100, int(buy_score * 1.2))
+                logger.info(f"PA {symbol}: OB Confluence Boost +20% on BUY (at BULLISH_OB)")
+            elif ctx.ob_type_at_price == "BEARISH_OB" and sell_score > 0:
+                sell_score = min(100, int(sell_score * 1.2))
+                logger.info(f"PA {symbol}: OB Confluence Boost +20% on SELL (at BEARISH_OB)")
+        
+        logger.info(
+            f"PA {symbol}: pattern={pattern} "
+            f"at_ob={at_ob_zone} "
+            f"at_sup={at_support} "
+            f"at_res={at_resist} "
+            f"Buy={buy_score} Sell={sell_score}"
         )
 
         if buy_score > sell_score and buy_score >= 40:
@@ -150,6 +211,48 @@ class PriceActionStrategy(BaseStrategy):
         )
 
     # ── Scoring helper ────────────────────────────────────────────────────────
+
+    def _check_pattern_at_ob(
+        self,
+        pattern: str,
+        at_ob_zone: bool,
+        ob_type: Optional[str],
+        at_support: bool,
+        at_resist: bool,
+    ) -> Tuple[str, int]:
+        """
+        Check if pattern occurs AT Order Block zone (STRONGEST signal!).
+        Pattern at OB = 3x stronger than pattern at regular S/R.
+        """
+        if pattern == "NONE" or pattern is None:
+            return "NO_PATTERN", 0
+        
+        bullish_patterns = ["HAMMER", "BULL_ENGULFING", "MORNING_STAR", "BULL_PINBAR"]
+        bearish_patterns = ["SHOOTING_STAR", "BEAR_ENGULFING", "EVENING_STAR", "BEAR_PINBAR"]
+        
+        # Pattern at OB = PERFECT entry!
+        if at_ob_zone:
+            if pattern in bullish_patterns and ob_type == "BULLISH_OB":
+                logger.info(f"PA: {pattern} at BULLISH OB - PERFECT BUY! Score=80")
+                return "OB_CONFLUENCE", 80
+            elif pattern in bearish_patterns and ob_type == "BEARISH_OB":
+                logger.info(f"PA: {pattern} at BEARISH OB - PERFECT SELL! Score=80")
+                return "OB_CONFLUENCE", 80
+        
+        # Pattern at support/resistance (regular)
+        if pattern in bullish_patterns and at_support:
+            logger.info(f"PA: {pattern} at SUPPORT - GOOD BUY. Score=60")
+            return "ZONE_CONFLUENCE", 60
+        elif pattern in bearish_patterns and at_resist:
+            logger.info(f"PA: {pattern} at RESISTANCE - GOOD SELL. Score=60")
+            return "ZONE_CONFLUENCE", 60
+        
+        # Pattern only (weak)
+        if pattern in bullish_patterns or pattern in bearish_patterns:
+            logger.info(f"PA: {pattern} but NOT at key zone - WEAK. Score=25")
+            return "NO_CONFLUENCE", 25
+        
+        return "NO_PATTERN", 0
 
     def _check_pattern_at_zone(
         self,
@@ -219,13 +322,22 @@ class PriceActionStrategy(BaseStrategy):
         buy  = 0
         sell = 0
 
+        # Base Rejection Score: Key level rejection without full pattern = 35
+        if pattern == "NONE" or pattern is None:
+            if strong_sup:
+                buy += 35
+                logger.debug("PA: Base rejection score 35 at strong support (no pattern)")
+            if strong_res:
+                sell += 35
+                logger.debug("PA: Base rejection score 35 at strong resistance (no pattern)")
+
         # Breakout + retest (highest priority)
         if bo_retest and bo_dir == "BUY":
             buy  += 50
         elif bo_retest and bo_dir == "SELL":
             sell += 50
 
-        # NEW: Pattern confluence scoring (replaces old pattern scoring)
+        # Pattern confluence scoring
         if pattern_dir == "BUY":
             if confluence == "ZONE_CONFLUENCE":
                 buy += 100  # Pattern AT zone = banks wameingia!

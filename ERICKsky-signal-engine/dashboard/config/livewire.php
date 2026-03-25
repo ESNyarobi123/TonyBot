@@ -36,4 +36,10 @@ return [
 
     'pagination_theme' => 'tailwind',
 
+    'asset_url' => null,
+
+    'app_url' => env('APP_URL', 'http://localhost'),
+
+    'asset_base_url' => env('ASSET_URL', null),
+
 ];

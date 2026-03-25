@@ -29,6 +29,7 @@ from typing import Dict, Optional
 from celery_app import celery_app
 from config import settings
 from data.twelve_data import twelve_data
+from data.data_fetcher import data_fetcher
 from database.models import Signal
 from database.repositories import BotStateRepository
 
@@ -41,6 +42,7 @@ from filters.market_regime import market_regime_detector
 from filters.consolidation_filter import consolidation_filter
 from filters.correlation_filter import correlation_filter
 from filters.session_analyzer import session_strength_analyzer
+from filters.dxy_filter import dxy_filter
 
 # ── Strategies ─────────────────────────────────────────────────────────────────
 from strategies.multi_timeframe import MultiTimeframeStrategy
@@ -54,9 +56,6 @@ from strategies.m15_confirmation import m15_confirmation
 # ── Signal pipeline ────────────────────────────────────────────────────────────
 from signals.signal_validator import signal_validator
 from notifications.notification_manager import notification_manager
-
-# ── Risk manager ───────────────────────────────────────────────────────────────
-from utils.risk_manager import risk_manager
 
 logger = logging.getLogger(__name__)
 
@@ -102,15 +101,6 @@ def scan_pair(
 
     try:
         # ══════════════════════════════════════════════════════════════════════
-        # STEP 1: Risk Manager (fastest check — no I/O except DB)
-        # ══════════════════════════════════════════════════════════════════════
-        if not force_filters:
-            risk_ok, risk_reason = risk_manager.check_limits(symbol)
-            if not risk_ok:
-                logger.info("[scan_pair] %s RISK BLOCKED: %s", symbol, risk_reason)
-                return {"status": "filtered", "reason": risk_reason, "symbol": symbol}
-
-        # ══════════════════════════════════════════════════════════════════════
         # STEP 2: Trading Session (weekday + active session)
         # ══════════════════════════════════════════════════════════════════════
         if not force_session:
@@ -130,22 +120,18 @@ def scan_pair(
                 return {"status": "filtered", "reason": "news", "symbol": symbol, "detail": news_msg}
 
         # ══════════════════════════════════════════════════════════════════════
-        # STEP 4: Fetch price (for spread check) + all OHLCV timeframes
+        # STEP 4: Fetch price + all OHLCV timeframes (smart: D1/H4 cached 4h)
         # ══════════════════════════════════════════════════════════════════════
         current_price = twelve_data.get_realtime_price(symbol)
         if current_price is None:
             logger.warning("[scan_pair] %s: could not fetch price", symbol)
             return {"status": "error", "reason": "price_fetch_failed", "symbol": symbol}
 
-        logger.info("[scan_pair] %s fetching OHLCV data…", symbol)
-        ohlcv_data: Dict = {}
-        for tf in _TIMEFRAMES:
-            count = 100 if tf == "M15" else 200
-            df = twelve_data.get_candles(symbol, tf, count=count)
-            if df is not None and not df.empty:
-                ohlcv_data[tf] = df
-            else:
-                logger.warning("[scan_pair] %s: empty/missing %s candles", symbol, tf)
+        logger.info("[scan_pair] %s smart-fetching OHLCV data (D1/H4 from cache, H1/M15 fresh)…", symbol)
+        ohlcv_data = data_fetcher.fetch_pair_smart(symbol)
+
+        # Strip None entries
+        ohlcv_data = {tf: df for tf, df in ohlcv_data.items() if df is not None and not df.empty}
 
         if not ohlcv_data or "H1" not in ohlcv_data:
             logger.error("[scan_pair] %s: missing critical OHLCV data", symbol)
@@ -234,6 +220,27 @@ def scan_pair(
             return {"status": "error", "reason": "all_strategies_failed", "symbol": symbol}
 
         # ══════════════════════════════════════════════════════════════════════
+        # STEP 9b: DXY H1 data for correlation filter (cache-first)
+        #          Fallback: use inverse of EURUSD H1 as USD strength proxy
+        # ══════════════════════════════════════════════════════════════════════
+        try:
+            dxy_h1 = data_fetcher.fetch_dxy()
+            dxy_filter.update_dxy_data(dxy_h1)
+            # If DXY fetch returned nothing, fall back to dual-pair proxy
+            if dxy_h1 is None or dxy_h1.empty:
+                eurusd_h1 = ohlcv_data.get("H1") if symbol == "EURUSD" else twelve_data.get_candles("EURUSD", "H1", count=50)
+                gbpusd_h1 = ohlcv_data.get("H1") if symbol == "GBPUSD" else twelve_data.get_candles("GBPUSD", "H1", count=50)
+                dxy_filter.update_from_dual_proxy(eurusd_h1, gbpusd_h1)
+        except Exception as exc:
+            logger.warning("[scan_pair] DXY data fetch failed: %s — trying dual proxy", exc)
+            try:
+                eurusd_h1 = ohlcv_data.get("H1") if symbol == "EURUSD" else twelve_data.get_candles("EURUSD", "H1", count=50)
+                gbpusd_h1 = ohlcv_data.get("H1") if symbol == "GBPUSD" else twelve_data.get_candles("GBPUSD", "H1", count=50)
+                dxy_filter.update_from_dual_proxy(eurusd_h1, gbpusd_h1)
+            except Exception as proxy_exc:
+                logger.warning("[scan_pair] Dual proxy also failed: %s — DXY filter bypassed", proxy_exc)
+
+        # ══════════════════════════════════════════════════════════════════════
         # STEP 10: Consensus Engine
         # ══════════════════════════════════════════════════════════════════════
         logger.info("[scan_pair] %s computing consensus…", symbol)
@@ -264,25 +271,39 @@ def scan_pair(
             }
 
         # ══════════════════════════════════════════════════════════════════════
+        # STEP 10b: DXY Correlation Filter (The Big Eye)
+        # ══════════════════════════════════════════════════════════════════════
+        if not force_filters:
+            dxy_ok, dxy_reason = dxy_filter.passes(symbol, consensus.direction)
+            if not dxy_ok:
+                logger.info("[scan_pair] %s DXY BLOCKED: %s", symbol, dxy_reason)
+                return {
+                    "status":  "filtered",
+                    "reason":  "dxy_correlation",
+                    "symbol":  symbol,
+                    "detail":  dxy_reason,
+                }
+
+        # ══════════════════════════════════════════════════════════════════════
         # STEP 11: Session Strength — dynamic effective minimum score
         # ══════════════════════════════════════════════════════════════════════
         utc_hour = datetime.now(timezone.utc).hour
         session  = session_strength_analyzer.analyze(symbol, utc_hour)
 
-        base_min = getattr(settings, "MIN_CONSENSUS_SCORE", 65)
+        base_min = getattr(settings, "MIN_CONSENSUS_SCORE", 80)
 
         if not session["allow"]:
             # Weak session — demand higher quality
             effective_min = base_min + 10
         elif session["boost"]:
-            # Prime session — slightly relax threshold
-            effective_min = max(base_min - 5, 55)
+            # Prime session — slightly relax threshold (but NEVER below 80)
+            effective_min = max(base_min - 5, 80)
         else:
             effective_min = base_min
 
-        # Regime trend boost
+        # Regime trend boost (but NEVER below 80 — institutional floor)
         if regime["regime"] == "TRENDING":
-            effective_min = max(effective_min - 5, 55)
+            effective_min = max(effective_min - 5, 80)
 
         adjusted_score = consensus.consensus_score
         if consensus.consensus_score < effective_min:
@@ -374,6 +395,8 @@ def scan_pair(
                 "news":         not force_filters,
                 "volatility":   not force_filters,
                 "regime":       regime["regime"],
+                "dxy_passed":   True,
+                "dxy_trend":    dxy_filter.trend,
                 "m15_confirmed": m15_result["confirmed"],
                 "m15_score":    m15_result["score"],
                 "patterns":     [p.get("name") for p in patterns["patterns"]],
@@ -459,24 +482,44 @@ def scan_all_pairs(
     force_filters: bool = False,
 ) -> Dict:
     """
-    Dispatch individual scan_pair tasks for all configured trading pairs.
-    Returns summary dict with task IDs for monitoring.
+    Orchestrate a full scan cycle:
+      1. Serialised data fetch (DXY + all pairs with 15s gaps)
+      2. Dispatch individual scan_pair tasks sequentially
+
+    The DataFetcher pre-warms the cache so each scan_pair task
+    hits Redis instead of the API — zero rate-limit risk.
     """
     pairs = getattr(settings, "TRADING_PAIRS", [])
-    logger.info("[scan_all_pairs] Dispatching %d pairs: %s", len(pairs), pairs)
+    logger.info("[scan_all_pairs] Starting serialised fetch for %d pairs: %s", len(pairs), pairs)
 
+    # ── Phase 1: Pre-fetch all data (serialised, rate-limited) ────────────
+    try:
+        dxy_h1, _all_data, _prices = data_fetcher.scan_cycle_fetch(pairs)
+        # Update DXY filter once for the whole cycle
+        dxy_filter.update_dxy_data(dxy_h1)
+        # Fallback: if DXY failed, use EURUSD + GBPUSD dual proxy
+        if dxy_h1 is None or dxy_h1.empty:
+            eurusd_h1 = _all_data.get("EURUSD", {}).get("H1")
+            gbpusd_h1 = _all_data.get("GBPUSD", {}).get("H1")
+            dxy_filter.update_from_dual_proxy(eurusd_h1, gbpusd_h1)
+        logger.info(
+            "[scan_all_pairs] Data pre-fetch complete — DXY=%s",
+            "OK" if dxy_h1 is not None else "EURUSD_PROXY",
+        )
+    except Exception as exc:
+        logger.error("[scan_all_pairs] Data pre-fetch failed: %s", exc)
+
+    # ── Phase 2: Dispatch analysis tasks (data is now cached) ─────────────
     task_ids = []
     for i, pair in enumerate(pairs):
-        countdown = i * 15  # stagger 15s apart to respect API rate limits
         task = scan_pair.apply_async(
             args=[pair],
             kwargs={"force_session": force_session, "force_filters": force_filters},
             queue="signals",
-            countdown=countdown,
         )
         task_ids.append({"pair": pair, "task_id": task.id})
         logger.debug(
-            "[scan_all_pairs] Dispatched %s → task %s (start in %ds)", pair, task.id, countdown
+            "[scan_all_pairs] Dispatched %s → task %s", pair, task.id,
         )
 
     return {"dispatched": len(task_ids), "tasks": task_ids}

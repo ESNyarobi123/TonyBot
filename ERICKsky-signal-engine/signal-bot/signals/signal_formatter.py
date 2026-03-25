@@ -123,16 +123,14 @@ class SignalFormatter:
         dir_arrow   = "📈" if is_buy else "📉"
         action      = "BUY" if is_buy else "SELL"
 
-        # ── Confidence / stars ────────────────────────────────────────────────
+        # ── Confidence / stars (INSTITUTIONAL GRADE) ─────────────────────────
         score = signal.consensus_score
         if score >= 90:
-            stars, conf_label, conf_emoji = "⭐⭐⭐⭐⭐", "VERY HIGH", "💎"
+            stars, conf_label, conf_emoji = "⭐⭐⭐⭐⭐", "SUPREME SIGNAL", "💎"
         elif score >= 80:
-            stars, conf_label, conf_emoji = "⭐⭐⭐⭐",   "HIGH",      "🔥"
-        elif score >= 70:
-            stars, conf_label, conf_emoji = "⭐⭐⭐",     "MEDIUM",    "✅"
+            stars, conf_label, conf_emoji = "⭐⭐⭐⭐",   "HIGH CONFIDENCE", "🔥"
         else:
-            stars, conf_label, conf_emoji = "⭐⭐",       "LOW",       "⚡"
+            stars, conf_label, conf_emoji = "⭐⭐",       "LOW",             "⚡"
 
         # ── Price helpers ─────────────────────────────────────────────────────
         pair = (signal.pair or "?").upper()
@@ -194,89 +192,89 @@ class SignalFormatter:
         chase_warn   = "chasing price UP! 📈" if is_buy else "chasing price DOWN! 📉"
 
         # ═════════════════════════════════════════════════════════════════════
-        # MESSAGE ASSEMBLY
+        # MESSAGE ASSEMBLY - AMAZING NEW TEMPLATE
         # ═════════════════════════════════════════════════════════════════════
         msg = (
-            f"{'🔥' * 3} *ERICKSKYBOT SIGNAL* {'🔥' * 3}\n"
-            f"{'━' * 32}\n\n"
-            f"{dir_emoji} *{pair}*  —  *{action}*  {dir_arrow}\n"
-            f"{conf_emoji} {stars}  Score: *{score}/100*  |  {conf_label}\n\n"
+            f"� *ERICKsky PREMIUM SIGNAL* �\n\n"
+            f"{dir_emoji} *{pair}* — *{action}* {dir_arrow}\n"
+            f"{conf_emoji} {stars} Score: *{score}/100* | {conf_label}\n\n"
         )
 
+        # SMC Structure block (if available)
         if extra_block:
             msg += extra_block + "\n\n"
 
-        # Trade setup box
+        # Trade setup - clean format
         msg += (
-            f"💰 *TRADE SETUP*\n"
-            f"┌──────────────────────────────┐\n"
-            f"│ 🎯 Entry:    `{fmt(entry)}`\n"
-            f"│ 🛑 Stop Loss: `{fmt(sl)}`"
-            f"  (-{sl_pips:.0f} pips)\n"
-            f"│ ✅ TP1:      `{fmt(tp1)}`"
-            f"  (+{tp1_pips:.0f} pips) RR 1:{rr1:.1f}\n"
+            f"💰 *TRADE SETUP:*\n"
+            f"├ Entry:    `{fmt(entry)}`\n"
+            f"├ SL:       `{fmt(sl)}` (-{sl_pips:.0f} pips)\n"
+            f"├ TP1:      `{fmt(tp1)}` (+{tp1_pips:.0f} pips) | RR 1:{rr1:.1f}\n"
         )
-        if tp2:
-            msg += (
-                f"│ ✅ TP2:      `{fmt(tp2)}`"
-                f"  (+{tp2_pips:.0f} pips) RR 1:{rr2:.1f}\n"
-            )
         if tp3:
-            msg += (
-                f"│ 🏆 TP3:      `{fmt(tp3)}`"
-                f"  (+{tp3_pips:.0f} pips) RR 1:{rr3:.1f}\n"
-            )
-        msg += f"└──────────────────────────────┘\n\n"
+            msg += f"├ TP2:      `{fmt(tp2)}` (+{tp2_pips:.0f} pips) | RR 1:{rr2:.1f}\n"
+            msg += f"└ TP3:      `{fmt(tp3)}` (+{tp3_pips:.0f} pips) | RR 1:{rr3:.1f}\n\n"
+        elif tp2:
+            msg += f"└ TP2:      `{fmt(tp2)}` (+{tp2_pips:.0f} pips) | RR 1:{rr2:.1f}\n\n"
+        else:
+            msg += "\n"
 
-        # Smart entry guide
+        # Smart entry - simplified
         msg += (
-            f"📌 *SMART ENTRY GUIDE*\n"
-            f"┌──────────────────────────────────┐\n"
-            f"│ ⭐ *BEST:*  {limit_action} `{fmt(lim)}`\n"
-            f"│      Wait for pullback"
-            f" (-{lim_pips:.0f} pips) 🎯\n"
-            f"│\n"
-            f"│ ✅ *OK:*    Wait H1 candle close\n"
-            f"│      Enter if candle {candle_rule}\n"
-            f"│\n"
-            f"│ ❌ *AVOID:* Market order now!\n"
-            f"│      Never {chase_warn}\n"
-            f"└──────────────────────────────────┘\n\n"
-
-            f"⚠️ *ENTRY RULES:*\n"
-            f"• Wait for pullback to limit zone\n"
-            f"• Enter ONLY after H1 candle closes\n"
-            f"• Place limit order — don't chase!\n"
-            f"• Valid for next {window_min} minutes only\n\n"
-
-            f"🏦 *Why limit entry?*\n"
-            f"_Banks sweep stops BEFORE moving!_\n"
-            f"_Wait for the dip = safer SL + better RR_ 📊\n\n"
-
-            f"🔄 *TRADE MANAGEMENT:*\n"
-            f"├ +{be_pips} pips → Move SL to entry ⚡\n"
-            f"├ +{close_pips} pips → Close 50% position 💰\n"
-            f"└ Remainder → Trail to TP2/TP3 🚀\n\n"
-
-            f"{'━' * 32}\n"
-            f"🧠 *Strategies: {agree}/{total_strats} agree*\n\n"
+            f"📌 *SMART ENTRY:*\n"
+            f"⭐ {limit_action} `{fmt(lim)}`\n"
+            f"(Wait for pullback - {lim_pips:.0f} pips away)\n\n"
         )
 
+        # Strategies agreement - clean format
+        msg += f"🧠 *Strategies: {agree}/{total_strats} agree* ✅\n"
+        
         if rows:
-            msg += "\n".join(rows) + "\n\n"
+            for row in rows:
+                msg += row + "\n"
+        
+        msg += "\n"
 
-        # Footer
+        # ── Institutional Filters Status ─────────────────────────────────────
+        fp = signal.filters_passed or {}
+
+        # DXY Filter status
+        dxy_passed = fp.get("dxy_passed", True)
+        dxy_trend = fp.get("dxy_trend")
+        if dxy_passed:
+            if dxy_trend == "BULLISH":
+                dxy_label = "✅ Passed (USD Strength 🔥)"
+            elif dxy_trend == "BEARISH":
+                dxy_label = "✅ Passed (USD Weakness 📉)"
+            else:
+                dxy_label = "✅ Passed (USD Neutral)"
+        else:
+            dxy_label = "❌ Blocked"
+        msg += f"🌍 *DXY Filter:* {dxy_label}\n"
+
+        # Liquidity Sweep status
+        smc_setup = fp.get("smc_setup")
+        swept = fp.get("liquidity_swept", False)
+        if swept:
+            msg += "💧 *Liquidity Sweep:* ✅ Confirmed (Stop Hunt Completed)\n"
+        elif smc_setup:
+            msg += "💧 *Liquidity Sweep:* ⏳ Pending\n"
+
+        msg += "\n"
+
+        # ── Active Management Block (Breakeven + Partial Profit) ─────────────
+        be_price = self._calc_breakeven_trigger(entry, tp1, is_buy)
+        pip_size = PIP_VALUES.get(pair, 0.0001)
+        be_sl = round(entry + pip_size if is_buy else entry - pip_size, 5)
+
         msg += (
-            f"{'━' * 32}\n"
-            f"⏰ *Valid Until:* {valid_str}\n"
-            f"💰 *Risk:* Max 1% per trade\n"
-            f"📉 *SL Pips:* {sl_pips:.0f}  |  "
-            f"*TP1 Pips:* {tp1_pips:.0f}\n"
-            f"{'━' * 32}\n\n"
-            f"🏆 *ERICKsky Signal Engine*\n"
-            f"📱 t.me/ERICKskySignals\n\n"
-            f"#{pair} #{action} #Forex #ERICKsky #Signals"
+            f"🔄 *ACTIVE MANAGEMENT:*\n"
+            f"├ ⚡ *Breakeven:* When price hits `{fmt(be_price)}`, move SL to `{fmt(be_sl)}`\n"
+            f"└ 💰 *Partial Profit:* Close 50% at TP1, let the rest run with SL at Entry\n\n"
         )
+
+        # Risk warning footer
+        msg += "⚠️ *Risk Warning:* Use proper risk management. 1% max per trade.\n"
 
         return msg
 
@@ -394,8 +392,7 @@ class SignalFormatter:
     @staticmethod
     def _build_context_block(signal: Signal) -> str:
         """
-        Optional context lines: regime, session, chart pattern, M15 status.
-        FIX D: The unused session_boost look-up was removed.
+        Optional context lines: regime, session, chart pattern, M15 status, SMC structure.
         """
         lines: List[str] = []
         fp = signal.filters_passed or {}
@@ -418,6 +415,21 @@ class SignalFormatter:
             session_name = SignalFormatter._session_label(utc_h)
         if session_name:
             lines.append(f"🕐 *Session:* {session_name}")
+
+        # SMC Structure (NEW!)
+        smc_setup = fp.get("smc_setup")
+        if smc_setup:
+            bos_type = fp.get("bos_type", "N/A")
+            at_ob = fp.get("at_ob", False)
+            ob_type = fp.get("ob_type", "N/A")
+            in_fvg = fp.get("in_fvg", False)
+            swept = fp.get("liquidity_swept", False)
+            
+            lines.append(f"🏦 *SMC Structure:* COMPLETE ✅")
+            lines.append(f"├ BOS: {bos_type}")
+            lines.append(f"├ OB:  {'Price at ' + ob_type if at_ob else 'Nearby'}")
+            lines.append(f"├ FVG: {'In zone ✅' if in_fvg else 'Nearby'}")
+            lines.append(f"└ Liquidity: {'Swept ✅' if swept else 'Pending'}")
 
         # Chart pattern
         pattern_list = fp.get("patterns") or []
@@ -461,6 +473,19 @@ class SignalFormatter:
         if 0 <= utc_hour < 7:
             return "ASIAN 🌏"
         return "OFF-HOURS 💤"
+
+    @staticmethod
+    def _calc_breakeven_trigger(
+        entry: float,
+        tp1: float,
+        is_buy: bool,
+    ) -> float:
+        """Calculate the price at which trade should be moved to breakeven (50% of TP1 distance)."""
+        distance = abs(tp1 - entry)
+        if is_buy:
+            return round(entry + distance * 0.5, 5)
+        else:
+            return round(entry - distance * 0.5, 5)
 
     @staticmethod
     def _score_bar(score: int, width: int = 8) -> str:

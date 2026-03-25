@@ -9,6 +9,7 @@ from filters.market_regime import market_regime_detector
 from filters.consolidation_filter import consolidation_filter
 from filters.correlation_filter import correlation_filter
 from filters.session_analyzer import session_strength_analyzer
+from filters.dxy_filter import dxy_filter
 
 __all__ = [
     "session_filter",
@@ -19,4 +20,5 @@ __all__ = [
     "consolidation_filter",
     "correlation_filter",
     "session_strength_analyzer",
+    "dxy_filter",
 ]

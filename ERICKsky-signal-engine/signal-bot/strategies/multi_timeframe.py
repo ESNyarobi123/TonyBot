@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 
 from strategies.base_strategy import BaseStrategy, StrategyResult
+from strategies.market_context import SharedMarketContext
 from config.settings import PIP_VALUES
 
 logger = logging.getLogger(__name__)
@@ -46,49 +47,58 @@ class MultiTimeframeStrategy(BaseStrategy):
         self,
         symbol: str,
         data: Dict[str, Optional[pd.DataFrame]],
+        ctx: SharedMarketContext = None,
     ) -> StrategyResult:
         """Run the full MTF pipeline for the given symbol."""
         try:
-            return self._run(symbol, data)
+            return self._run(symbol, data, ctx)
         except Exception as exc:
             logger.exception("MTF error for %s: %s", symbol, exc)
             return self._neutral_result(self.name, f"Error: {exc}")
 
     # ── Main pipeline ─────────────────────────────────────────────────────────
 
-    def _run(self, symbol: str, data: dict) -> StrategyResult:
+    def _run(self, symbol: str, data: dict, ctx: SharedMarketContext = None) -> StrategyResult:
         pip_size = PIP_VALUES.get(symbol.upper(), 0.0001)
 
         df_d1 = self._get_df(data, "D1")
         df_h4 = self._get_df(data, "H4")
         df_h1 = self._get_df(data, "H1")
 
-        # DEBUG LOGGING - Check data availability
-        logger.info(f"MTF DEBUG {symbol}: D1={df_d1.shape if df_d1 is not None else None}, H4={df_h4.shape if df_h4 is not None else None}, H1={df_h1.shape if df_h1 is not None else None}")
-
-        # ── STEP 1: Trend Direction (D1 preferred, H4 fallback) ────────────────
-        d1_trend, d1_score = self._d1_trend(df_d1)
-        
-        # DEBUG: Log D1 trend result
-        logger.info(f"MTF DEBUG {symbol}: D1 trend={d1_trend}, score={d1_score}")
-        
-        # FIX 3: If D1 insufficient, use H4 as trend source
-        if d1_trend == "RANGING" or df_d1 is None or len(df_d1) < 50:
-            if df_h4 is not None and len(df_h4) >= 30:
-                h4_trend, h4_score = self._h4_trend(df_h4)
-                logger.info(f"MTF DEBUG {symbol}: D1 insufficient, using H4 trend={h4_trend}, score={h4_score}")
-                if h4_trend != "RANGING":
-                    d1_trend = h4_trend.replace("H4_", "WEAK_")  # Mark as H4-derived
-                    d1_score = h4_score
+        # USE CONTEXT if provided
+        if ctx:
+            d1_trend = ctx.d1_trend
+            h4_trend = ctx.h4_trend
+            h1_trend = ctx.h1_trend
+            
+            # Map context trends to MTF format
+            if d1_trend == "UP":
+                d1_trend = "STRONG_UP"
+                d1_score = 100
+            elif d1_trend == "DOWN":
+                d1_trend = "STRONG_DOWN"
+                d1_score = 100
+            else:
+                d1_trend = "RANGING"
+                d1_score = 0
+        else:
+            # Fallback to old calculation if no context
+            d1_trend, d1_score = self._d1_trend(df_d1)
+            
+            if d1_trend == "RANGING" or df_d1 is None or len(df_d1) < 50:
+                if df_h4 is not None and len(df_h4) >= 30:
+                    h4_trend, h4_score = self._h4_trend(df_h4)
+                    if h4_trend != "RANGING":
+                        d1_trend = h4_trend.replace("H4_", "WEAK_")
+                        d1_score = h4_score
         
         # Determine direction from trend
         d1_direction = "BUY" if "UP" in d1_trend else "SELL" if "DOWN" in d1_trend else "NEUTRAL"
         self._last_d1_direction = d1_direction
         self._last_d1_trend = d1_trend
 
-        # If still ranging after H4 fallback, return neutral
+        # If still ranging, return neutral
         if d1_trend == "RANGING" or d1_direction == "NEUTRAL":
-            logger.info(f"MTF DEBUG {symbol}: Returning NEUTRAL - no clear trend (D1={d1_trend})")
             return StrategyResult(
                 strategy_name=self.name,
                 score=0,
@@ -98,8 +108,33 @@ class MultiTimeframeStrategy(BaseStrategy):
                 metadata={"d1_trend": d1_trend, "h4_zone": "NONE", "h1_signal": "NONE"},
             )
 
-        # ── STEP 2: H4 Zone ───────────────────────────────────────────────────
-        h4_zone, h4_detail, h4_zone_score = self._h4_zone(df_h4, symbol, pip_size, d1_trend)
+        # ── STEP 2: H4 Zone (USE CONTEXT KEY LEVELS) ──────────────────────────
+        if ctx:
+            nearest_sup = ctx.nearest_support
+            nearest_res = ctx.nearest_resistance
+            current = ctx.current_price
+            atr = ctx.atr_h1
+            
+            # Check if at support in uptrend
+            h4_zone = "NONE"
+            h4_zone_score = 0
+            h4_detail = {}
+            
+            if nearest_sup and d1_direction == "BUY":
+                dist = abs(current - nearest_sup)
+                if dist < atr * 0.5:
+                    h4_zone = "SUPPORT"
+                    h4_zone_score = 100
+                    h4_detail = {"support": nearest_sup, "distance_atr": dist/atr}
+            
+            if nearest_res and d1_direction == "SELL":
+                dist = abs(current - nearest_res)
+                if dist < atr * 0.5:
+                    h4_zone = "RESISTANCE"
+                    h4_zone_score = 100
+                    h4_detail = {"resistance": nearest_res, "distance_atr": dist/atr}
+        else:
+            h4_zone, h4_detail, h4_zone_score = self._h4_zone(df_h4, symbol, pip_size, d1_trend)
 
         # ── STEP 3: H1 Entry Trigger ──────────────────────────────────────────
         h1_signal, h1_detail = self._h1_entry(df_h1)
@@ -145,8 +180,16 @@ class MultiTimeframeStrategy(BaseStrategy):
                 f"Conflicting: D1={d1_trend}, H4={h4_zone}, H1={h1_signal}"
             )
 
-        # Scale by D1 strength (STRONG=100pts, WEAK=65pts → factor 0.65–1.0)
-        final_score = int(raw_score * d1_score / 100)
+        # D1 strength adjustment: WEAK trend = -10 deduction instead of multiplier
+        final_score = raw_score
+        if "WEAK" in d1_trend:
+            final_score = max(0, final_score - 10)
+        
+        # BONUS: Complete SMC setup confirms MTF
+        if ctx and ctx.complete_smc_setup:
+            if ctx.smc_setup_direction == d1_direction:
+                final_score = min(100, final_score + 20)
+                logger.info(f"MTF {symbol}: SMC Setup BONUS +20 ({d1_direction})")
 
         # BUG FIX 2: HARD BLOCK counter-trend signals
         # If D1 shows STRONG_UP trend, block ALL SELL signals

@@ -17,7 +17,15 @@ logger = logging.getLogger(__name__)
 
 def _dispatch_scans() -> None:
     """Trigger Celery scan tasks for all configured pairs."""
+    from filters.session_filter import SessionFilter
     from tasks.scan_pair import scan_all_pairs
+    
+    is_active, reason = SessionFilter().is_active()
+    
+    if not is_active:
+        logger.info(f"Scan SKIPPED: {reason}")
+        return
+    
     logger.info("Scheduler: dispatching scans at %s UTC", datetime.now(timezone.utc).strftime("%H:%M"))
     scan_all_pairs.delay()
 

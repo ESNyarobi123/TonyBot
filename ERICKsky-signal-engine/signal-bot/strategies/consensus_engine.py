@@ -5,7 +5,7 @@ Weighted voting across all 4 strategies to produce a final tradeable signal.
 
 Rules:
   1. Minimum 3 out of 4 strategies must agree on direction (BUY or SELL)
-  2. Weighted consensus score must be >= MIN_CONSENSUS_SCORE (default 75)
+  2. Weighted consensus score must be >= MIN_CONSENSUS_SCORE (default 80)
   3. SL/TP levels are calculated using ATR 14 from TechnicalIndicators metadata
 
 Strategy weights (sum to 1.0):
@@ -15,10 +15,9 @@ Strategy weights (sum to 1.0):
   TechnicalIndicators → 0.20
 
 Confidence labels:
-  VERY_HIGH → weighted score >= 88
-  HIGH      → weighted score >= 75
-  MEDIUM    → weighted score >= 60
-  LOW       → below 60 (not issued)
+  SUPREME   → weighted score >= 90  (💎 Institutional Grade)
+  HIGH      → weighted score >= 80  (🔥 High Confidence)
+  LOW       → below 80 (not issued — blocked)
 """
 
 import logging
@@ -26,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from strategies.base_strategy import StrategyResult
+from strategies.market_context import MarketContextBuilder
 from config import settings
 from config.settings import PIP_VALUES
 
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 MIN_AGREEMENT:         int   = 3      # out of 4 strategies
-MIN_CONSENSUS_SCORE:   int   = getattr(settings, "MIN_CONSENSUS_SCORE", 75)
+MIN_CONSENSUS_SCORE:   int   = getattr(settings, "MIN_CONSENSUS_SCORE", 80)
 
 # ATR-based SL/TP multipliers (FIXED: tighter SL, better RR)
 _SL_ATR_MULT:  float = 1.0   # stop loss = 1.0 × ATR (tighter)
@@ -41,12 +41,11 @@ _TP1_ATR_MULT: float = 1.5   # TP1 = 1.5 × ATR (1:1.5 RR)
 _TP2_ATR_MULT: float = 2.0   # TP2 = 2.0 × ATR (1:2.0 RR)
 _TP3_ATR_MULT: float = 3.0   # TP3 = 3.0 × ATR (1:3.0 RR)
 
-# Confidence label thresholds (FIXED: higher quality signals)
+# Confidence label thresholds (INSTITUTIONAL GRADE)
 _CONFIDENCE_MAP: List[Tuple[int, str]] = [
-    (90, "VERY_HIGH"),  # 4/4 strategies or very strong 3/4
-    (80, "HIGH"),       # strong 3/4 agreement
-    (65, "MEDIUM"),     # weak 3/4 (minimum viable)
-    (0,  "LOW"),        # < 65 = skip!
+    (90, "SUPREME"),    # 💎 SUPREME SIGNAL (Institutional) — 4/4 or very strong 3/4
+    (80, "HIGH"),       # 🔥 HIGH CONFIDENCE — strong 3/4 agreement
+    (0,  "LOW"),        # < 80 = BLOCKED!
 ]
 
 
@@ -185,19 +184,31 @@ class ConsensusEngine:
                 ),
             )
 
-        # ── STEP 3: Weighted score from ALL strategies ─────────────────────────
-        # BUG FIX: Use all 4 strategies, not just agreeing ones
-        # This prevents inflated scores from partial weight division
-        # Example: (70×0.25 + 100×0.20) / 0.45 = 66 (WRONG - inflated!)
-        # Correct:   (0×0.25 + 40×0.30 + 70×0.25 + 100×0.20) / 1.0 = 49.5 (REAL!)
-        total_weight  = sum(self.WEIGHTS.values())  # Always 1.0
-        weighted_sum  = 0.0
+        # ── STEP 3: Dynamic Weighted score ───────────────────────────────────
+        # If a strategy is NEUTRAL, redistribute its weight among agreeing ones
+        neutral_weight = 0.0
+        agreeing_weight = 0.0
         for r in results:
             w = self.WEIGHTS.get(r.strategy_name, 0.25)
-            # NEUTRAL/0 scores contribute 0 but their weight still counts
-            weighted_sum  += r.score * w
+            if r.direction == "NEUTRAL":
+                neutral_weight += w
+            elif r.direction == dominant_dir:
+                agreeing_weight += w
 
-        weighted_score  = weighted_sum / total_weight  # Divide by 1.0
+        weighted_sum = 0.0
+        for r in results:
+            w = self.WEIGHTS.get(r.strategy_name, 0.25)
+            if r.direction == "NEUTRAL":
+                continue  # skip neutral — its weight is redistributed
+            if r.direction == dominant_dir and agreeing_weight > 0:
+                # Redistribute neutral weight proportionally among agreeing strategies
+                bonus = (w / agreeing_weight) * neutral_weight
+                weighted_sum += r.score * (w + bonus)
+            else:
+                weighted_sum += r.score * w
+
+        total_weight = sum(self.WEIGHTS.values())
+        weighted_score = weighted_sum / total_weight
         consensus_score = int(round(min(100.0, max(0.0, weighted_score))))
         
         logger.info(
@@ -207,9 +218,9 @@ class ConsensusEngine:
 
         # ── STEP 4: Minimum score gate ────────────────────────────────────────
         if consensus_score < MIN_CONSENSUS_SCORE:
-            logger.info(
-                "Consensus: score %d < min %d for %s → rejected",
-                consensus_score, MIN_CONSENSUS_SCORE, dominant_dir,
+            logger.warning(
+                "[Score Below Threshold: Skipping] %s %s score=%d < min=%d → BLOCKED",
+                symbol, dominant_dir, consensus_score, MIN_CONSENSUS_SCORE,
             )
             return ConsensusResult(
                 direction="NEUTRAL", consensus_score=consensus_score,
@@ -219,6 +230,7 @@ class ConsensusEngine:
                 agreement_count=agreement_count, total_strategies=len(results),
                 is_valid=False,
                 reasoning=(
+                    f"[Score Below Threshold: Skipping] "
                     f"Score {consensus_score} below minimum {MIN_CONSENSUS_SCORE}"
                 ),
             )
@@ -296,7 +308,10 @@ class ConsensusEngine:
                     break
 
         if atr_value is None:
-            atr_value = 15 * pip_size   # fallback: 15 pips
+            if symbol.upper() == "XAUUSD":
+                atr_value = 50 * pip_size   # fallback: 50 pips for XAUUSD
+            else:
+                atr_value = 20 * pip_size   # fallback: 20 pips for Forex
 
         atr_pips = round(atr_value / pip_size, 1)
 

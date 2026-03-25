@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 
 from strategies.base_strategy import BaseStrategy, StrategyResult
+from strategies.market_context import SharedMarketContext
 from config.settings import PIP_VALUES
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,7 @@ _OB_SCAN_CANDLES:  int = 50
 _FVG_SCAN_CANDLES: int = 50
 _LIQ_SCAN_CANDLES: int = 30
 _LIQ_PROXIMITY_PIPS: int = 5    # pips to consider two highs/lows "equal"
+_SWEEP_LOOKBACK: int = 50       # candles to look back for liquidity sweep confirmation
 
 
 @dataclass
@@ -66,125 +68,210 @@ class SmartMoneyStrategy(BaseStrategy):
         self,
         symbol: str,
         data: Dict[str, Optional[pd.DataFrame]],
+        ctx: SharedMarketContext = None,
     ) -> StrategyResult:
         """Run the full SMC analysis pipeline."""
         try:
-            return self._run(symbol, data)
+            return self._run(symbol, data, ctx)
         except Exception as exc:
             logger.exception("SMC error for %s: %s", symbol, exc)
             return self._neutral_result(self.name, f"Error: {exc}")
 
     # ── Main pipeline ─────────────────────────────────────────────────────────
 
-    def _run(self, symbol: str, data: dict) -> StrategyResult:
+    def _run(self, symbol: str, data: dict, ctx: SharedMarketContext = None) -> StrategyResult:
         pip_size = PIP_VALUES.get(symbol.upper(), 0.0001)
 
-        df_h4 = self._get_df(data, "H4")
-        df_h1 = self._get_df(data, "H1")
+        # USE CONTEXT if provided
+        if ctx:
+            score_buy = 0
+            score_sell = 0
+            
+            # BOS/CHOCH
+            if ctx.structure.bos_type == "BULLISH":
+                score_buy += 25
+            elif ctx.structure.bos_type == "BEARISH":
+                score_sell += 25
+            
+            # At Order Block (MOST IMPORTANT!)
+            if ctx.price_at_ob:
+                if ctx.ob_type_at_price == "BULLISH_OB":
+                    score_buy += 40
+                elif ctx.ob_type_at_price == "BEARISH_OB":
+                    score_sell += 40
+            elif ctx.nearest_bullish_ob and ctx.nearest_bullish_ob.valid:
+                score_buy += 15
+            elif ctx.nearest_bearish_ob and ctx.nearest_bearish_ob.valid:
+                score_sell += 15
+            
+            # FVG
+            if ctx.price_in_fvg:
+                score_buy += 20
+                score_sell += 20
+            elif ctx.nearest_bull_fvg:
+                score_buy += 10
+            elif ctx.nearest_bear_fvg:
+                score_sell += 10
+            
+            # Liquidity sweep (CONFIRMS direction!)
+            if ctx.recent_liquidity_swept:
+                if ctx.swept_direction == "BUY":
+                    score_buy += 25
+                elif ctx.swept_direction == "SELL":
+                    score_sell += 25
+            
+            # BONUS: Complete SMC setup!
+            if ctx.complete_smc_setup:
+                if ctx.smc_setup_direction == "BUY":
+                    score_buy = max(score_buy, int(ctx.smc_setup_score))
+                elif ctx.smc_setup_direction == "SELL":
+                    score_sell = max(score_sell, int(ctx.smc_setup_score))
+            
+            logger.info(
+                f"SMC {symbol}: "
+                f"BOS={ctx.structure.bos_type} "
+                f"AtOB={ctx.price_at_ob} "
+                f"InFVG={ctx.price_in_fvg} "
+                f"Swept={ctx.recent_liquidity_swept} "
+                f"Buy={score_buy} Sell={score_sell}"
+            )
+            
+            buy_score = score_buy
+            sell_score = score_sell
+            
+            # Create metadata from context
+            bull_ob = ctx.nearest_bullish_ob
+            bear_ob = ctx.nearest_bearish_ob
+            bull_fvg = ctx.nearest_bull_fvg
+            bear_fvg = ctx.nearest_bear_fvg
+            liq_bull_sweep = ctx.recent_liquidity_swept and ctx.swept_direction == "BUY"
+            liq_bear_sweep = ctx.recent_liquidity_swept and ctx.swept_direction == "SELL"
+            mkt_structure = ctx.structure.bias
+            
+        else:
+            # Fallback to old calculation if no context
+            df_h4 = self._get_df(data, "H4")
+            df_h1 = self._get_df(data, "H1")
+            
+            if df_h4 is None:
+                return self._neutral_result(self.name, "No H4 data for SMC")
+
+            price = float(df_h4["close"].iloc[-1])
+
+            obs_bull, obs_bear = self._detect_order_blocks(df_h4, pip_size)
+            bull_ob = self._nearest_ob(obs_bull, price, pip_size)
+            bear_ob = self._nearest_ob(obs_bear, price, pip_size)
+
+            fvg_df = df_h1 if df_h1 is not None else df_h4
+            all_fvg = self._detect_fvgs(fvg_df, pip_size)
+            bull_fvg = next((f for f in all_fvg if f.direction == "BULLISH" and not f.filled), None)
+            bear_fvg = next((f for f in all_fvg if f.direction == "BEARISH" and not f.filled), None)
+
+            liq_bull_sweep, liq_bear_sweep = self._detect_liquidity_sweeps(df_h4, pip_size)
+            mkt_structure = self._market_structure(df_h4)
+
+            buy_score = self._compute_score(
+                ob=bull_ob, ob_count=len(obs_bull),
+                fvg=bull_fvg, liq_sweep=liq_bull_sweep,
+                structure=mkt_structure, direction="BUY",
+                price=price, pip_size=pip_size,
+            )
+            sell_score = self._compute_score(
+                ob=bear_ob, ob_count=len(obs_bear),
+                fvg=bear_fvg, liq_sweep=liq_bear_sweep,
+                structure=mkt_structure, direction="SELL",
+                price=price, pip_size=pip_size,
+            )
         
-        # DEBUG LOGGING - Check data availability
-        logger.info(f"SMC DEBUG {symbol}: H4={df_h4.shape if df_h4 is not None else None}, H1={df_h1.shape if df_h1 is not None else None}")
-
-        if df_h4 is None:
-            logger.warning(f"SMC DEBUG {symbol}: No H4 data available!")
-            return self._neutral_result(self.name, "No H4 data for SMC")
-
-        price = float(df_h4["close"].iloc[-1])
-        
-        # DEBUG
-        logger.info(f"SMC DEBUG {symbol}: Current price={price}")
-
-        # ── 1. Order Block Detection (H4) ─────────────────────────────────────
-        obs_bull, obs_bear = self._detect_order_blocks(df_h4, pip_size)
-        bull_ob = self._nearest_ob(obs_bull, price, pip_size)
-        bear_ob = self._nearest_ob(obs_bear, price, pip_size)
-        
-        # DEBUG
-        logger.info(f"SMC DEBUG {symbol}: Order blocks found - bullish={len(obs_bull)}, bearish={len(obs_bear)}")
-        logger.info(f"SMC DEBUG {symbol}: Nearest OB - bull={bull_ob is not None}, bear={bear_ob is not None}")
-
-        # ── 2. Fair Value Gap Detection (H1 preferred, H4 fallback) ──────────
-        fvg_df  = df_h1 if df_h1 is not None else df_h4
-        all_fvg = self._detect_fvgs(fvg_df, pip_size)
-        bull_fvg = next((f for f in all_fvg if f.direction == "BULLISH" and not f.filled), None)
-        bear_fvg = next((f for f in all_fvg if f.direction == "BEARISH" and not f.filled), None)
-        
-        # DEBUG
-        logger.info(f"SMC DEBUG {symbol}: FVGs found={len(all_fvg)}, bull_fvg={bull_fvg is not None}, bear_fvg={bear_fvg is not None}")
-
-        # ── 3. Liquidity Zone Sweeps (H4) ─────────────────────────────────────
-        liq_bull_sweep, liq_bear_sweep = self._detect_liquidity_sweeps(df_h4, pip_size)
-        
-        # DEBUG
-        logger.info(f"SMC DEBUG {symbol}: Liquidity sweeps - bull={liq_bull_sweep}, bear={liq_bear_sweep}")
-
-        # ── 4. Market Structure (H4) ──────────────────────────────────────────
-        mkt_structure = self._market_structure(df_h4)
-        
-        # DEBUG
-        logger.info(f"SMC DEBUG {symbol}: Market structure={mkt_structure}")
-
-        # ── Scoring ───────────────────────────────────────────────────────────
-        buy_score  = self._compute_score(
-            ob=bull_ob, ob_count=len(obs_bull),
-            fvg=bull_fvg, liq_sweep=liq_bull_sweep,
-            structure=mkt_structure, direction="BUY",
-            price=price, pip_size=pip_size,
-        )
-        sell_score = self._compute_score(
-            ob=bear_ob, ob_count=len(obs_bear),
-            fvg=bear_fvg, liq_sweep=liq_bear_sweep,
-            structure=mkt_structure, direction="SELL",
-            price=price, pip_size=pip_size,
-        )
-        
-        # DEBUG
-        logger.info(f"SMC DEBUG {symbol}: Buy score={buy_score}, Sell score={sell_score}")
-
         # Partial scoring enhancement
-        # Give minimum 20 if any SMC element found
-        if bull_fvg or liq_bull_sweep or bull_ob:
-            buy_score = max(buy_score, 20)  # Minimum 20 if any SMC element
-        if bear_fvg or liq_bear_sweep or bear_ob:
-            sell_score = max(sell_score, 20)  # Minimum 20 if any SMC element
+        if not ctx:
+            if bull_fvg or liq_bull_sweep or bull_ob:
+                buy_score = max(buy_score, 20)
+            if bear_fvg or liq_bear_sweep or bear_ob:
+                sell_score = max(sell_score, 20)
 
-        # FIX 4: Lower threshold from 40 to 20 for partial SMC signals
+        # ── INSTITUTIONAL: Liquidity Sweep Confirmation ──────────────────────
+        # An OB alone is NOT enough. We need proof of a liquidity sweep.
+        # If no sweep is detected, reduce the score by 50%.
+        liq_sweep_buy_confirmed = False
+        liq_sweep_sell_confirmed = False
+
+        if ctx:
+            liq_sweep_buy_confirmed = bool(
+                ctx.recent_liquidity_swept and ctx.swept_direction == "BUY"
+            )
+            liq_sweep_sell_confirmed = bool(
+                ctx.recent_liquidity_swept and ctx.swept_direction == "SELL"
+            )
+        else:
+            # Fallback: check swing low/high sweeps in last 20 candles
+            df_h4 = self._get_df(data, "H4")
+            if df_h4 is not None and len(df_h4) >= _SWEEP_LOOKBACK:
+                liq_sweep_buy_confirmed, liq_sweep_sell_confirmed = (
+                    self._detect_institutional_sweep(df_h4, pip_size)
+                )
+
+        if not liq_sweep_buy_confirmed and buy_score > 0:
+            logger.info(
+                "SMC %s: No bullish liquidity sweep detected — "
+                "reducing buy_score %d → %d (20%% penalty)",
+                symbol, buy_score, int(buy_score * 0.8),
+            )
+            buy_score = int(buy_score * 0.8)
+
+        if not liq_sweep_sell_confirmed and sell_score > 0:
+            logger.info(
+                "SMC %s: No bearish liquidity sweep detected — "
+                "reducing sell_score %d → %d (20%% penalty)",
+                symbol, sell_score, int(sell_score * 0.8),
+            )
+            sell_score = int(sell_score * 0.8)
+
         if buy_score > sell_score and buy_score >= 20:
             direction = "BUY"
             score     = buy_score
             active_ob  = bull_ob
             active_fvg = bull_fvg
-            reasoning  = (
-                f"Bullish OB={bull_ob is not None} FVG={bull_fvg is not None} "
-                f"LiqSweep={liq_bull_sweep} Struct={mkt_structure}"
+            ob_present = bull_ob is not None if not ctx else ctx.nearest_bullish_ob is not None
+            fvg_present = bull_fvg is not None if not ctx else ctx.nearest_bull_fvg is not None
+            reasoning = (
+                f"Bullish OB={ob_present} FVG={fvg_present} "
+                f"LiqSweep={liq_bull_sweep} SweepConfirmed={liq_sweep_buy_confirmed} "
+                f"Struct={mkt_structure}"
             )
         elif sell_score > buy_score and sell_score >= 20:
             direction = "SELL"
             score     = sell_score
             active_ob  = bear_ob
             active_fvg = bear_fvg
-            reasoning  = (
-                f"Bearish OB={bear_ob is not None} FVG={bear_fvg is not None} "
-                f"LiqSweep={liq_bear_sweep} Struct={mkt_structure}"
+            ob_present = bear_ob is not None if not ctx else ctx.nearest_bearish_ob is not None
+            fvg_present = bear_fvg is not None if not ctx else ctx.nearest_bear_fvg is not None
+            reasoning = (
+                f"Bearish OB={ob_present} FVG={fvg_present} "
+                f"LiqSweep={liq_bear_sweep} SweepConfirmed={liq_sweep_sell_confirmed} "
+                f"Struct={mkt_structure}"
             )
         else:
             direction  = "NEUTRAL"
             score      = 0
             active_ob  = None
             active_fvg = None
-            reasoning  = "No SMC confluence detected"
-        
-        # DEBUG final result
-        logger.info(f"SMC DEBUG {symbol}: FINAL direction={direction}, score={score}")
+            reasoning = "No SMC confluence detected"
 
-        ob_meta = (
-            {"direction": active_ob.direction, "high": active_ob.high, "low": active_ob.low}
-            if active_ob else None
-        )
-        fvg_meta = (
-            {"direction": active_fvg.direction, "top": active_fvg.top, "bottom": active_fvg.bottom}
-            if active_fvg else None
-        )
+        ob_meta = None
+        fvg_meta = None
+        
+        if active_ob:
+            if hasattr(active_ob, 'direction'):
+                ob_meta = {"direction": active_ob.direction, "high": active_ob.high, "low": active_ob.low}
+            else:
+                ob_meta = {"direction": active_ob.type, "high": active_ob.high, "low": active_ob.low}
+        
+        if active_fvg:
+            if hasattr(active_fvg, 'direction'):
+                fvg_meta = {"direction": active_fvg.direction, "top": active_fvg.top, "bottom": active_fvg.bottom}
+            else:
+                fvg_meta = {"direction": active_fvg.type, "top": active_fvg.high, "bottom": active_fvg.low}
 
         return StrategyResult(
             strategy_name=self.name,
@@ -271,7 +358,7 @@ class SmartMoneyStrategy(BaseStrategy):
         c = df["close"].values
 
         # FIX 4: Reduce from 3 candles to 2 for order block detection
-        MIN_IMPULSE_CANDLES = 2  # was 3
+        MIN_IMPULSE_CANDLES = 1  # was 2, detect faster institutional moves
         
         for i in range(n):
             candle_range = h[i] - l[i]
@@ -481,3 +568,77 @@ class SmartMoneyStrategy(BaseStrategy):
         if lh and ll:
             return "BEARISH"
         return "RANGING"
+
+    # ── CONCEPT 5: Institutional Liquidity Sweep Confirmation ─────────────────
+
+    def _detect_institutional_sweep(
+        self,
+        df: pd.DataFrame,
+        pip_size: float,
+    ) -> Tuple[bool, bool]:
+        """
+        Anti-stop-hunt confirmation for Order Block entries.
+
+        Buy signal requirement:
+          Price must have swept (dropped below) a significant swing low
+          within the last _SWEEP_LOOKBACK candles, then reversed back above it.
+
+        Sell signal requirement:
+          Price must have swept (risen above) a significant swing high
+          within the last _SWEEP_LOOKBACK candles, then reversed back below it.
+
+        Returns (bull_sweep_confirmed, bear_sweep_confirmed).
+        """
+        n = min(_SWEEP_LOOKBACK, len(df))
+        if n < 5:
+            return False, False
+
+        h = df["high"].values[-n:]
+        l = df["low"].values[-n:]
+        c = df["close"].values[-n:]
+        current_price = float(c[-1])
+
+        # Find significant swing lows and swing highs (3-bar pivot)
+        swing_lows: List[float] = []
+        swing_highs: List[float] = []
+
+        for i in range(2, len(h) - 2):
+            if l[i] < l[i-1] and l[i] < l[i-2] and l[i] < l[i+1] and l[i] < l[i+2]:
+                swing_lows.append(float(l[i]))
+            if h[i] > h[i-1] and h[i] > h[i-2] and h[i] > h[i+1] and h[i] > h[i+2]:
+                swing_highs.append(float(h[i]))
+
+        # Also use the session low (minimum of the lookback) as a fallback
+        session_low = float(np.min(l[:-3])) if len(l) > 3 else None
+        session_high = float(np.max(h[:-3])) if len(h) > 3 else None
+
+        # Bullish sweep: price wicked below a swing low then closed back above
+        bull_sweep = False
+        check_levels = swing_lows + ([session_low] if session_low else [])
+        for level in check_levels:
+            # Recent candles swept below the level
+            recent_low = float(np.min(l[-5:]))
+            if recent_low < level and current_price > level:
+                bull_sweep = True
+                logger.debug(
+                    "Institutional bullish sweep confirmed: "
+                    "wick=%.5f < level=%.5f, price=%.5f > level",
+                    recent_low, level, current_price,
+                )
+                break
+
+        # Bearish sweep: price wicked above a swing high then closed back below
+        bear_sweep = False
+        check_levels = swing_highs + ([session_high] if session_high else [])
+        for level in check_levels:
+            recent_high = float(np.max(h[-5:]))
+            if recent_high > level and current_price < level:
+                bear_sweep = True
+                logger.debug(
+                    "Institutional bearish sweep confirmed: "
+                    "wick=%.5f > level=%.5f, price=%.5f < level",
+                    recent_high, level, current_price,
+                )
+                break
+
+        return bull_sweep, bear_sweep

@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 
 from strategies.base_strategy import BaseStrategy, StrategyResult
+from strategies.market_context import SharedMarketContext
 from config.settings import PIP_VALUES
 
 logger = logging.getLogger(__name__)
@@ -53,17 +54,18 @@ class TechnicalStrategy(BaseStrategy):
         self,
         symbol: str,
         data: Dict[str, Optional[pd.DataFrame]],
+        ctx: SharedMarketContext = None,
     ) -> StrategyResult:
         """Run the full technical analysis on H1 data."""
         try:
-            return self._run(symbol, data)
+            return self._run(symbol, data, ctx)
         except Exception as exc:
             logger.exception("Technical error for %s: %s", symbol, exc)
             return self._neutral_result(self.name, f"Error: {exc}")
 
     # ── Main pipeline ─────────────────────────────────────────────────────────
 
-    def _run(self, symbol: str, data: dict) -> StrategyResult:
+    def _run(self, symbol: str, data: dict, ctx: SharedMarketContext = None) -> StrategyResult:
         df = self._get_df(data, "H1")
         if df is None:
             return self._neutral_result(self.name, "No H1 data")
@@ -75,27 +77,25 @@ class TechnicalStrategy(BaseStrategy):
         high   = df["high"]
         low    = df["low"]
         volume = df["volume"] if "volume" in df.columns else pd.Series(dtype=float)
+        current = float(close.iloc[-1])
 
-        # ── INDICATOR 1: EMA Stack ─────────────────────────────────────────────
         ema_align, ema_score, ema_cross = self._ema_stack(close)
 
-        # ── INDICATOR 2a: RSI ─────────────────────────────────────────────────
         rsi_val, rsi_signal, rsi_divergence = self._rsi_analysis(close, high, low)
 
-        # ── INDICATOR 2b: MACD ────────────────────────────────────────────────
         macd_signal, macd_hist, macd_cross_zero = self._macd_analysis(close)
-
-        # ── INDICATOR 3a: ATR (volatility gate) ───────────────────────────────
-        atr_val = float(self._atr(df, 14).iloc[-1])
+        
+        # Use context ATR if available
+        if ctx:
+            atr_val = ctx.atr_h1
+        else:
+            atr_val = float(self._atr(df, 14).iloc[-1])
         atr_ok  = atr_val >= min_atr_px
 
-        # ── INDICATOR 3b: Bollinger Bands ─────────────────────────────────────
         bb_signal, bb_squeeze = self._bollinger_analysis(close)
 
-        # ── INDICATOR 4: Volume ───────────────────────────────────────────────
         vol_quality = self._volume_quality(volume)
 
-        # ── Score accumulation ────────────────────────────────────────────────
         buy_score, sell_score = self._compute_scores(
             ema_align=ema_align,
             ema_score=ema_score,
@@ -110,6 +110,31 @@ class TechnicalStrategy(BaseStrategy):
             vol_quality=vol_quality,
             atr_ok=atr_ok,
         )
+        
+        # RSI Divergence using context structure
+        if ctx and ctx.structure.swing_lows:
+            last_low_price = ctx.structure.swing_lows[-1].price
+            if current < last_low_price and rsi_val > 35:
+                buy_score += 20
+        
+        # ATR volatility check
+        if ctx and ctx.atr_h1 < 0.0005:
+            buy_score = int(buy_score * 0.7)
+            sell_score = int(sell_score * 0.7)
+        
+        # CONTEXT BONUS: If SMC setup + indicators agree = STRONG!
+        if ctx and ctx.complete_smc_setup:
+            if ctx.smc_setup_direction == "BUY" and buy_score > sell_score:
+                buy_score += 15
+            elif ctx.smc_setup_direction == "SELL" and sell_score > buy_score:
+                sell_score += 15
+        
+        # Structure alignment
+        if ctx:
+            if ctx.structure.bias == "BULLISH" and buy_score > sell_score:
+                buy_score += 10
+            elif ctx.structure.bias == "BEARISH" and sell_score > buy_score:
+                sell_score += 10
 
         # ── Direction decision ────────────────────────────────────────────────
         if not atr_ok:
