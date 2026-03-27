@@ -10,7 +10,7 @@ Validates entry timing with M15 data using:
 """
 
 import logging
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -142,6 +142,90 @@ class M15Confirmation:
         loss   = (-delta.clip(upper=0)).ewm(span=period, adjust=False).mean()
         rs     = gain / loss.replace(0, float("nan"))
         return (100 - (100 / (1 + rs))).values
+
+
+    def confirm_sniper(
+        self,
+        m1_df: Optional[pd.DataFrame],
+        m5_df: Optional[pd.DataFrame],
+        direction: str,
+        symbol: str,
+    ) -> Dict:
+        """
+        Sniper entry confirmation: require a confirmed candle close in the
+        signal direction on M1 or M5 before firing the Telegram alert.
+
+        Checks the last fully-closed candle (iloc[-2]) on each timeframe.
+        Returns confirmed=True if at least one timeframe agrees.
+
+        Returns:
+            dict with:
+              confirmed     – bool  (True = alert may fire)
+              m1_confirmed  – bool
+              m5_confirmed  – bool
+              confirming_tf – str | None  ("M1" | "M5" | None)
+        """
+        m1_ok = self._check_candle_close(m1_df, direction, "M1", symbol)
+        m5_ok = self._check_candle_close(m5_df, direction, "M5", symbol)
+
+        confirmed = m1_ok or m5_ok
+        confirming_tf: Optional[str] = None
+        if m1_ok:
+            confirming_tf = "M1"
+        elif m5_ok:
+            confirming_tf = "M5"
+
+        logger.info(
+            "[Sniper Confirmation] %s %s → M1=%s M5=%s confirmed=%s",
+            symbol, direction,
+            "YES" if m1_ok else "no",
+            "YES" if m5_ok else "no",
+            confirmed,
+        )
+
+        return {
+            "confirmed":     confirmed,
+            "m1_confirmed":  m1_ok,
+            "m5_confirmed":  m5_ok,
+            "confirming_tf": confirming_tf,
+        }
+
+    def _check_candle_close(
+        self,
+        df: Optional[pd.DataFrame],
+        direction: str,
+        tf_label: str,
+        symbol: str,
+    ) -> bool:
+        """
+        Return True if the last confirmed closed candle on `df` closes
+        in the signal direction.
+
+        Uses iloc[-2] (second-to-last row) as the most recently CLOSED
+        candle; iloc[-1] may still be forming.
+        """
+        if df is None or len(df) < 2:
+            logger.debug(
+                "[Sniper %s] %s — insufficient data (len=%d)",
+                tf_label, symbol, 0 if df is None else len(df),
+            )
+            return False
+
+        last_close = float(df["close"].iloc[-2])
+        last_open  = float(df["open"].iloc[-2])
+
+        if direction == "BUY":
+            result = last_close > last_open
+        else:
+            result = last_close < last_open
+
+        logger.info(
+            "[Sniper %s] %s %s: open=%.5f close=%.5f → %s",
+            tf_label, symbol, direction,
+            last_open, last_close,
+            "CONFIRMED" if result else "not confirmed",
+        )
+        return result
 
 
 # Module-level singleton

@@ -44,6 +44,8 @@ SYMBOL_MAP: Dict[str, str] = {
 }
 
 TIMEFRAME_MAP: Dict[str, str] = {
+    "M1":  "1min",
+    "M5":  "5min",
     "M15": "15min",
     "H1":  "1h",
     "H4":  "4h",
@@ -54,11 +56,15 @@ TIMEFRAME_MAP: Dict[str, str] = {
 # D1/H4: persist for 4 hours (14400 s) — only re-fetch once per 4h window
 # H1/M15: shorter TTL — refetched every scan cycle
 CACHE_TTL_SECONDS: Dict[str, int] = {
+    "M1":      1 * 60,     # 60 s    — new candle every 1 min
+    "M5":      5 * 60,     # 300 s   — new candle every 5 min
     "M15":    12 * 60,     # 720 s   — new candle every 15 min
     "H1":     50 * 60,     # 3000 s  — new candle every 60 min
     "H4":    4 * 3600,     # 14400 s — fetch once per 4-hour window
     "D1":    4 * 3600,     # 14400 s — fetch once per 4-hour window
     # Legacy lowercase aliases
+    "1min":    1 * 60,
+    "5min":    5 * 60,
     "15min":  12 * 60,
     "1h":     50 * 60,
     "4h":    4 * 3600,

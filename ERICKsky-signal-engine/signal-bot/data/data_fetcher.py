@@ -30,13 +30,16 @@ from data.cache_manager import cache
 logger = logging.getLogger(__name__)
 
 # Timeframes that are critical for entry signals (fetched every cycle)
-_FAST_TIMEFRAMES: List[str] = ["M15", "H1"]
+_FAST_TIMEFRAMES: List[str] = ["M1", "M5", "M15", "H1"]
+
+# Sniper entry timeframes (fetched with smaller lookback)
+_SNIPER_TIMEFRAMES: List[str] = ["M1", "M5"]
 
 # Timeframes that change slowly (cached for 4 hours, skip API if fresh)
 _SLOW_TIMEFRAMES: List[str] = ["H4", "D1"]
 
-# All 4 strategy timeframes in fetch order
-_ALL_TIMEFRAMES: List[str] = ["D1", "H4", "H1", "M15"]
+# All strategy timeframes in fetch order
+_ALL_TIMEFRAMES: List[str] = ["D1", "H4", "H1", "M15", "M5", "M1"]
 
 # Delay between pair fetch batches (seconds)
 _INTER_PAIR_DELAY: float = 15.0
@@ -117,16 +120,19 @@ class DataFetcher:
     def fetch_pair_smart(
         self,
         symbol: str,
-        count_fast: int = 100,
-        count_slow: int = 200,
+        count_fast: int = settings.CANDLE_LOOKBACK,
+        count_slow: int = settings.CANDLE_LOOKBACK,
+        count_sniper: int = settings.CANDLE_LOOKBACK_SNIPER,
     ) -> Dict[str, Optional[pd.DataFrame]]:
         """
         Smart fetch for one pair:
           • D1/H4 → serve from cache if still valid (4h TTL); API only on miss.
-          • H1/M15 → always fetch fresh from API (critical for entry).
+          • H1/M15 → always fetch fresh from API (500 candles for EMA/SMC accuracy).
+          • M1/M5  → always fetch fresh from API (100 candles for sniper entry).
 
         Returns:
-            Dict[timeframe -> DataFrame]  e.g. {"D1": df, "H4": df, "H1": df, "M15": df}
+            Dict[timeframe -> DataFrame]  e.g. {"D1": df, "H4": df, "H1": df,
+                                                 "M15": df, "M5": df, "M1": df}
         """
         result: Dict[str, Optional[pd.DataFrame]] = {}
 
@@ -144,10 +150,20 @@ class DataFetcher:
                 df = twelve_data.get_candles(symbol, tf, count=count_slow)
                 result[tf] = df
 
-        # 2. Fast timeframes — always fetch fresh
-        for tf in _FAST_TIMEFRAMES:
-            count = count_fast if tf == "M15" else count_slow
-            df = twelve_data.get_candles(symbol, tf, count=count)
+        # 2. Fast strategy timeframes (H1, M15) — always fetch fresh (500 candles)
+        for tf in ["M15", "H1"]:
+            df = twelve_data.get_candles(symbol, tf, count=count_fast)
+            result[tf] = df
+
+        # 3. Sniper timeframes (M1, M5) — always fetch fresh (100 candles)
+        #    Controlled by FETCH_M1 / FETCH_M5 feature flags in .env
+        sniper_map = {"M1": settings.FETCH_M1, "M5": settings.FETCH_M5}
+        for tf in _SNIPER_TIMEFRAMES:
+            if not sniper_map.get(tf, True):
+                logger.debug("[Smart Fetch] %s/%s skipped — feature flag disabled", symbol, tf)
+                result[tf] = None
+                continue
+            df = twelve_data.get_candles(symbol, tf, count=count_sniper)
             result[tf] = df
 
         available = sum(1 for v in result.values() if v is not None)

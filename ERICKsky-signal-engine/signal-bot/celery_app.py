@@ -22,6 +22,7 @@ celery_app = Celery(
         "tasks.daily_report",
         "tasks.news_updater",
         "tasks.performance_analyzer",
+        "tasks.data_maintenance",
     ],
 )
 
@@ -40,6 +41,7 @@ celery_app.conf.update(
         "tasks.expire_old_signals":          {"queue": "default"},
         "tasks.update_news_database":        {"queue": "default"},
         "tasks.weekly_performance_analysis": {"queue": "default"},
+        "tasks.clean_m1_m5_cache":           {"queue": "default"},
     },
 
     # ── Worker settings ───────────────────────────────────────────────────────
@@ -52,12 +54,12 @@ celery_app.conf.update(
 
     # ── Beat schedule (periodic tasks) ───────────────────────────────────────
     beat_schedule={
-        # Scan all pairs every hour during active sessions
-        "scan-all-pairs-hourly": {
-            "task":   "tasks.scan_all_pairs",
-            "schedule": crontab(minute=0),       # top of every hour
-            "args":   [],
-            "kwargs": {"force_session": False},
+        # Scan all pairs every 15 minutes (Sniper Mode — EURUSD & XAUUSD)
+        "scan-all-pairs-15min": {
+            "task":     "tasks.scan_all_pairs",
+            "schedule": crontab(minute="*/15"),
+            "args":     [],
+            "kwargs":   {"force_session": False},
         },
 
         # Daily performance report at 21:30 UTC (NY session close)
@@ -82,6 +84,13 @@ celery_app.conf.update(
         "weekly-performance-analysis": {
             "task":     "tasks.weekly_performance_analysis",
             "schedule": crontab(hour=21, minute=0, day_of_week="sunday"),
+        },
+
+        # ── Sniper Mode: purge M1/M5 Redis OHLCV cache daily at 00:05 UTC ──────
+        # Keeps Redis lean — M1/M5 data is only needed for the current session
+        "clean-m1-m5-cache-daily": {
+            "task":     "tasks.clean_m1_m5_cache",
+            "schedule": crontab(hour=0, minute=5),
         },
     },
 )

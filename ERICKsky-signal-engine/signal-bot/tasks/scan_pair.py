@@ -66,8 +66,8 @@ _pa_strategy   = PriceActionStrategy()
 _tech_strategy = TechnicalStrategy()
 _consensus     = ConsensusEngine()
 
-# Timeframes to fetch per scan
-_TIMEFRAMES = ["D1", "H4", "H1", "M15"]
+# Timeframes to fetch per scan (includes M1/M5 for sniper entry confirmation)
+_TIMEFRAMES = ["D1", "H4", "H1", "M15", "M5", "M1"]
 
 
 @celery_app.task(
@@ -221,24 +221,30 @@ def scan_pair(
 
         # ══════════════════════════════════════════════════════════════════════
         # STEP 9b: DXY H1 data for correlation filter (cache-first)
-        #          Fallback: use inverse of EURUSD H1 as USD strength proxy
+        #          Fallback: EURUSD inverse proxy (Deep Focus — EURUSD only)
         # ══════════════════════════════════════════════════════════════════════
         try:
             dxy_h1 = data_fetcher.fetch_dxy()
             dxy_filter.update_dxy_data(dxy_h1)
-            # If DXY fetch returned nothing, fall back to dual-pair proxy
+            # If DXY unavailable, fall back to EURUSD-only inverse proxy
             if dxy_h1 is None or dxy_h1.empty:
-                eurusd_h1 = ohlcv_data.get("H1") if symbol == "EURUSD" else twelve_data.get_candles("EURUSD", "H1", count=50)
-                gbpusd_h1 = ohlcv_data.get("H1") if symbol == "GBPUSD" else twelve_data.get_candles("GBPUSD", "H1", count=50)
-                dxy_filter.update_from_dual_proxy(eurusd_h1, gbpusd_h1)
+                eurusd_h1 = (
+                    ohlcv_data.get("H1")
+                    if symbol == "EURUSD"
+                    else twelve_data.get_candles("EURUSD", "H1", count=50)
+                )
+                dxy_filter.update_from_eurusd_proxy(eurusd_h1)
         except Exception as exc:
-            logger.warning("[scan_pair] DXY data fetch failed: %s — trying dual proxy", exc)
+            logger.warning("[scan_pair] DXY data fetch failed: %s — trying EURUSD proxy", exc)
             try:
-                eurusd_h1 = ohlcv_data.get("H1") if symbol == "EURUSD" else twelve_data.get_candles("EURUSD", "H1", count=50)
-                gbpusd_h1 = ohlcv_data.get("H1") if symbol == "GBPUSD" else twelve_data.get_candles("GBPUSD", "H1", count=50)
-                dxy_filter.update_from_dual_proxy(eurusd_h1, gbpusd_h1)
+                eurusd_h1 = (
+                    ohlcv_data.get("H1")
+                    if symbol == "EURUSD"
+                    else twelve_data.get_candles("EURUSD", "H1", count=50)
+                )
+                dxy_filter.update_from_eurusd_proxy(eurusd_h1)
             except Exception as proxy_exc:
-                logger.warning("[scan_pair] Dual proxy also failed: %s — DXY filter bypassed", proxy_exc)
+                logger.warning("[scan_pair] EURUSD proxy also failed: %s — DXY filter bypassed", proxy_exc)
 
         # ══════════════════════════════════════════════════════════════════════
         # STEP 10: Consensus Engine
@@ -370,6 +376,36 @@ def scan_pair(
                 # For now, we proceed but mark the signal accordingly
 
         # ══════════════════════════════════════════════════════════════════════
+        # STEP 13b: Sniper Entry Confirmation (M1/M5 candle-close hard gate)
+        # Require a confirmed candle close in the signal direction on M1 OR M5
+        # before firing the Telegram alert. Hard block if neither confirms.
+        # ══════════════════════════════════════════════════════════════════════
+        if not force_filters:
+            m1_df = ohlcv_data.get("M1")
+            m5_df = ohlcv_data.get("M5")
+            sniper_result = m15_confirmation.confirm_sniper(
+                m1_df, m5_df, consensus.direction, symbol
+            )
+            if not sniper_result["confirmed"]:
+                logger.info(
+                    "[scan_pair] %s SNIPER BLOCKED: no M1/M5 candle close in %s direction",
+                    symbol, consensus.direction,
+                )
+                return {
+                    "status":  "filtered",
+                    "reason":  "sniper_no_m1_m5_confirmation",
+                    "symbol":  symbol,
+                    "detail":  (
+                        f"No {consensus.direction} candle close confirmed on M1 or M5 — "
+                        f"waiting for sniper entry"
+                    ),
+                }
+            logger.info(
+                "[scan_pair] %s SNIPER CONFIRMED on %s",
+                symbol, sniper_result["confirming_tf"],
+            )
+
+        # ══════════════════════════════════════════════════════════════════════
         # STEP 14: Correlation Filter
         # ══════════════════════════════════════════════════════════════════════
         if not force_filters:
@@ -407,17 +443,19 @@ def scan_pair(
             consensus_score=boosted_score,
             confidence=consensus.confidence_label,
             filters_passed={
-                "session":      not force_session,
-                "spread":       not force_filters,
-                "news":         not force_filters,
-                "volatility":   not force_filters,
-                "regime":       regime["regime"],
-                "dxy_passed":   True,
-                "dxy_trend":    dxy_filter.trend,
-                "m15_confirmed": m15_result["confirmed"],
-                "m15_score":    m15_result["score"],
-                "patterns":     [p.get("name") for p in patterns["patterns"]],
-                "session_boost": session.get("boost", False),
+                "session":           not force_session,
+                "spread":            not force_filters,
+                "news":              not force_filters,
+                "volatility":        not force_filters,
+                "regime":            regime["regime"],
+                "dxy_passed":        True,
+                "dxy_trend":         dxy_filter.trend,
+                "m15_confirmed":     m15_result["confirmed"],
+                "m15_score":         m15_result["score"],
+                "sniper_confirmed":  sniper_result.get("confirmed") if not force_filters else True,
+                "sniper_tf":         sniper_result.get("confirming_tf") if not force_filters else "bypassed",
+                "patterns":          [p.get("name") for p in patterns["patterns"]],
+                "session_boost":     session.get("boost", False),
             },
             status="PENDING",
             sent_at=datetime.now(timezone.utc),
@@ -450,18 +488,20 @@ def scan_pair(
         elapsed = (datetime.now(timezone.utc) - start_ts).total_seconds()
 
         result = {
-            "status":          "success",
-            "symbol":          symbol,
-            "signal_id":       signal_id,
-            "direction":       signal.direction,
-            "consensus_score": signal.consensus_score,
-            "confidence":      signal.confidence,
-            "regime":          regime["regime"],
-            "session":         session["sessions"],
-            "patterns":        [p.get("name") for p in patterns["patterns"]],
-            "m15_confirmed":   m15_result["confirmed"],
-            "m15_score":       m15_result["score"],
-            "elapsed_s":       round(elapsed, 2),
+            "status":            "success",
+            "symbol":            symbol,
+            "signal_id":         signal_id,
+            "direction":         signal.direction,
+            "consensus_score":   signal.consensus_score,
+            "confidence":        signal.confidence,
+            "regime":            regime["regime"],
+            "session":           session["sessions"],
+            "patterns":          [p.get("name") for p in patterns["patterns"]],
+            "m15_confirmed":     m15_result["confirmed"],
+            "m15_score":         m15_result["score"],
+            "sniper_confirmed":  sniper_result.get("confirmed") if not force_filters else True,
+            "sniper_tf":         sniper_result.get("confirming_tf") if not force_filters else "bypassed",
+            "elapsed_s":         round(elapsed, 2),
         }
 
         logger.info(
@@ -514,11 +554,10 @@ def scan_all_pairs(
         dxy_h1, _all_data, _prices = data_fetcher.scan_cycle_fetch(pairs)
         # Update DXY filter once for the whole cycle
         dxy_filter.update_dxy_data(dxy_h1)
-        # Fallback: if DXY failed, use EURUSD + GBPUSD dual proxy
+        # Fallback: if DXY failed, use EURUSD inverse proxy (Deep Focus strategy)
         if dxy_h1 is None or dxy_h1.empty:
             eurusd_h1 = _all_data.get("EURUSD", {}).get("H1")
-            gbpusd_h1 = _all_data.get("GBPUSD", {}).get("H1")
-            dxy_filter.update_from_dual_proxy(eurusd_h1, gbpusd_h1)
+            dxy_filter.update_from_eurusd_proxy(eurusd_h1)
         logger.info(
             "[scan_all_pairs] Data pre-fetch complete — DXY=%s",
             "OK" if dxy_h1 is not None else "EURUSD_PROXY",

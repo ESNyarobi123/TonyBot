@@ -55,10 +55,10 @@ TELEGRAM_PROXY_URL: str = os.getenv("TELEGRAM_PROXY_URL", "")  # e.g. socks5://u
 
 # ─── Trading Configuration ────────────────────────────────────────────────────
 
-_pairs_raw: str = os.getenv("TRADING_PAIRS", "EURUSD,GBPUSD,USDJPY,XAUUSD")
+_pairs_raw: str = os.getenv("TRADING_PAIRS", "EURUSD,XAUUSD")
 TRADING_PAIRS: List[str] = [p.strip() for p in _pairs_raw.split(",") if p.strip()]
 
-SCAN_INTERVAL_MINUTES: int = int(os.getenv("SCAN_INTERVAL_MINUTES", "60"))
+SCAN_INTERVAL_MINUTES: int = int(os.getenv("SCAN_INTERVAL_MINUTES", "15"))
 MIN_CONSENSUS_SCORE: int = int(os.getenv("MIN_CONSENSUS_SCORE", "80"))
 SIGNAL_VALID_MINUTES: int = int(os.getenv("SIGNAL_VALID_MINUTES", "240"))
 MAX_SIGNALS_PER_PAIR_PER_DAY: int = int(
@@ -69,11 +69,12 @@ RISK_REWARD_RATIO: float = float(os.getenv("RISK_REWARD_RATIO", "2.0"))
 # ─── DXY Correlation Filter ──────────────────────────────────────────────────
 
 # USD pairs affected by DXY (Dollar Index) correlation
-DXY_USD_PAIRS: List[str] = ["EURUSD", "GBPUSD", "AUDUSD", "NZDUSD"]
+# Deep Focus: only EURUSD (inverse) and XAUUSD (inverse) are traded
+DXY_USD_PAIRS: List[str] = ["EURUSD", "XAUUSD"]
 DXY_SYMBOL: str = "DXY"  # Dollar Index symbol for data fetcher
 DXY_EMA_PERIOD: int = 21  # EMA period for DXY trend detection
-DXY_PROXY_MODE: bool = True  # Use EURUSD/GBPUSD inverse proxy when DXY unavailable
-DXY_PROXY_PAIRS: List[str] = ["EURUSD", "GBPUSD"]  # Pairs for dual-proxy DXY derivation
+DXY_PROXY_MODE: bool = True  # Use EURUSD inverse proxy when DXY unavailable
+DXY_PROXY_PAIRS: List[str] = ["EURUSD"]  # EURUSD-only proxy for deep focus strategy
 
 # ─── Strict Trading Window (UTC) ─────────────────────────────────────────────
 
@@ -94,8 +95,18 @@ PRIMARY_TIMEFRAME: str = "1h"
 TREND_TIMEFRAME: str = "4h"
 ENTRY_TIMEFRAME: str = "15min"
 
+# Sniper entry timeframes (M1/M5) for precise entry confirmation
+SNIPER_TIMEFRAMES: List[str] = ["M1", "M5"]
+
+# Feature flags: enable/disable M1 and M5 sniper timeframe fetching
+FETCH_M1: bool = os.getenv("FETCH_M1", "True").strip().lower() == "true"
+FETCH_M5: bool = os.getenv("FETCH_M5", "True").strip().lower() == "true"
+
 # Number of candles to fetch per timeframe
-CANDLE_LOOKBACK: int = 200
+# H1 and M15: 500 candles for accurate EMA and SMC zone detection
+CANDLE_LOOKBACK: int = 500
+# M1/M5 sniper timeframes: lighter lookback (confirmation only)
+CANDLE_LOOKBACK_SNIPER: int = 100
 
 # ─── Session Windows (UTC hours) ──────────────────────────────────────────────
 
